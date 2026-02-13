@@ -1,0 +1,24 @@
+{
+  "cookies": [
+    {
+      "name": "_tb_token_",
+      "value": "your_token_here",
+      "domain": ".goofish.com",
+      "path": "/"
+    },
+    {
+      "name": "cookie2",
+      "value": "your_cookie2_here",
+      "domain": ".goofish.com",
+      "path": "/"
+    }
+  ],
+  "origins": [
+    {
+      "origin": "https://www.goofish.com",
+      "localStorage": [
+        {"name": "_m_h5_tk", "value": "your_token"}
+      ]
+    }
+  ]
+}
