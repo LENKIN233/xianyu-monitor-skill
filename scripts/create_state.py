@@ -4,13 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import stat
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Any
+
+
+def _credential_output_path(output_file: str) -> Path:
+    requested = Path(output_file).expanduser()
+    if not requested.name:
+        raise ValueError("output must name a file")
+    return requested.parent.resolve() / requested.name
 
 
 def parse_cookie_string(cookie_string: str) -> list[dict[str, Any]]:
@@ -42,8 +51,20 @@ def parse_cookie_string(cookie_string: str) -> list[dict[str, Any]]:
 
 
 def _secure_write_json(output_file: str, payload: dict[str, Any], force: bool) -> Path:
-    output = Path(output_file).expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
+    output = _credential_output_path(output_file)
+    parent_created = False
+    try:
+        output.parent.mkdir(parents=True)
+        parent_created = True
+    except FileExistsError:
+        pass
+    if parent_created:
+        try:
+            output.parent.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        except OSError:
+            pass
+    if output.is_symlink():
+        raise ValueError(f"refusing to write login state through a symlink: {output}")
     if output.exists() and not force:
         raise FileExistsError(f"{output} already exists; pass --force to replace it")
 
@@ -61,12 +82,21 @@ def _secure_write_json(output_file: str, payload: dict[str, Any], force: bool) -
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, output)
+        if force:
+            os.replace(temporary, output)
+        else:
+            try:
+                os.link(temporary, output)
+            except FileExistsError as exc:
+                raise FileExistsError(
+                    f"{output} already exists; pass --force to replace it"
+                ) from exc
+            temporary.unlink()
         try:
             output.chmod(stat.S_IRUSR | stat.S_IWUSR)
         except OSError:
             pass
-    except Exception:
+    except BaseException:
         temporary.unlink(missing_ok=True)
         raise
     return output
@@ -84,6 +114,20 @@ def create_storage_state(
 
 def _read_cookie_input(args: argparse.Namespace) -> str:
     if args.cookie_stdin:
+        if sys.stdin.isatty():
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", getpass.GetPassWarning)
+                    return getpass.getpass(
+                        "Cookie header (input hidden): ", stream=sys.stderr
+                    ).strip()
+            except getpass.GetPassWarning as exc:
+                raise ValueError(
+                    "unable to disable terminal echo; pipe the Cookie header "
+                    "through stdin or use a protected --cookie-file"
+                ) from exc
+            except EOFError as exc:
+                raise ValueError("cookie input ended before a value was read") from exc
         return sys.stdin.read().strip()
     if args.cookie_file:
         return Path(args.cookie_file).expanduser().read_text(encoding="utf-8").strip()
@@ -114,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         cookie_string = _read_cookie_input(args)
         output = create_storage_state(cookie_string, args.output, force=args.force)
     except (OSError, ValueError) as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=True))
         return 2
 
     print(
@@ -124,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
                 "output": str(output),
                 "cookies": len(parse_cookie_string(cookie_string)),
             },
-            ensure_ascii=False,
+            ensure_ascii=True,
         )
     )
     return 0
