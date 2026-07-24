@@ -19,11 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This project is inspired by and based on the architecture of ai-goofish-monitor
-(https://github.com/Usagi-org/ai-goofish-monitor) by Usagi-org.
-
-The Chrome extension for login state extraction is from the original project
-and retains its original license.

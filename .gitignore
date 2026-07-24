@@ -1,8 +1,12 @@
-# User data
-state.json
-tasks.json
-results.json
-results_test.json
+# User data and credentials
+/state*.json
+/*_state.json
+/login*.json
+/*.cookies.json
+/tasks.json
+/tasks.json.lock
+/results.json
+/results_test.json
 
 # Logs
 *.log
@@ -29,6 +33,10 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
 
 # IDE
 .vscode/

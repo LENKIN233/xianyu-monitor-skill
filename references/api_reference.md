@@ -1,265 +1,141 @@
-# API 参考文档
+# CLI and output reference
 
-## AI Bridge API
+## Contents
 
-### AIBridge 类
+- [spider.py](#spiderpy)
+- [task_manager.py](#task_managerpy)
+- [monitor.py](#monitorpy)
+- [create_state.py](#create_statepy)
+- [Exit codes](#exit-codes)
 
-#### 构造函数
+## `spider.py`
 
-```python
-AIBridge(workspace_dir: Optional[str] = None)
+Search Xianyu once and emit a JSON object.
+
+```text
+--keyword, -k       Required search keyword
+--min-price         Inclusive local minimum price
+--max-price         Inclusive local maximum price
+--location          Case-insensitive location substring
+--pages, -p         Maximum pages to fetch; default 1
+--state, -s         Playwright state or enhanced snapshot
+--proxy             HTTP(S) or SOCKS proxy
+--browser-channel   Optional Playwright channel, such as chrome
+--headed            Show the browser
+--retries, -r       Network/browser attempts; default 3
+--debug             Include applied filters in output
 ```
 
-**参数：**
-- `workspace_dir`: 工作目录，默认为系统临时目录下的 `xianyu_ai_bridge` 文件夹
-
-#### 方法
-
-##### create_analysis_request
-
-```python
-create_analysis_request(
-    product_data: Dict,
-    image_paths: List[str],
-    prompt_text: str,
-    task_id: Optional[str] = None
-) -> str
-```
-
-创建分析请求并返回请求 ID。
-
-**参数：**
-- `product_data`: 商品数据字典
-- `image_paths`: 图片文件路径列表
-- `prompt_text`: 分析提示词
-- `task_id`: 可选的任务 ID，用于追踪
-
-**返回：**
-- `request_id`: 请求唯一标识符
-
-##### get_analysis_request
-
-```python
-get_analysis_request(request_id: str) -> Optional[Dict]
-```
-
-获取指定请求的数据。
-
-**参数：**
-- `request_id`: 请求 ID
-
-**返回：**
-- 请求数据字典，不存在返回 None
-
-##### save_analysis_result
-
-```python
-save_analysis_result(request_id: str, result: Dict) -> bool
-```
-
-保存分析结果。
-
-**参数：**
-- `request_id`: 请求 ID
-- `result`: 分析结果字典
-
-**返回：**
-- 是否保存成功
-
-**结果格式示例：**
-```json
-{
-  "prompt_version": "EagleEye-V6.4",
-  "is_recommended": true,
-  "reason": "卖家可信，商品描述详细，价格合理",
-  "risk_tags": [],
-  "criteria_analysis": {
-    "model_chip": { "status": "PASS", "comment": "型号正确", "evidence": "描述中明确标注" },
-    "battery_health": { "status": "PASS", "comment": "健康度良好", "evidence": "显示90%" },
-    "condition": { "status": "PASS", "comment": "成色新", "evidence": "图片显示无划痕" },
-    "history": { "status": "PASS", "comment": "无维修史", "evidence": "卖家声明" },
-    "seller_type": { 
-      "status": "PASS", 
-      "persona": "个人卖家",
-      "comment": "行为符合个人卖家特征",
-      "analysis_details": {}
-    },
-    "shipping": { "status": "PASS", "comment": "包邮", "evidence": "标注包邮" },
-    "seller_credit": { "status": "PASS", "comment": "信用极好", "evidence": "信用分850" }
-  }
-}
-```
-
-##### get_analysis_result
-
-```python
-get_analysis_result(request_id: str, timeout: int = 300) -> Optional[Dict]
-```
-
-阻塞等待并获取分析结果。
-
-**参数：**
-- `request_id`: 请求 ID
-- `timeout`: 超时时间（秒），默认 300 秒
-
-**返回：**
-- 分析结果字典，超时返回 None
-
-##### list_pending_requests
-
-```python
-list_pending_requests() -> List[str]
-```
-
-列出所有待处理的请求 ID。
-
-**返回：**
-- 请求 ID 列表
-
-##### cancel_request
-
-```python
-cancel_request(request_id: str) -> bool
-```
-
-取消分析请求。
-
-**参数：**
-- `request_id`: 请求 ID
-
-**返回：**
-- 是否取消成功
-
-## AIClient 类（Patched 版本）
-
-保持与原版本兼容的接口。
-
-### 构造函数
-
-```python
-AIClient()
-```
-
-### 方法
-
-#### is_available
-
-```python
-is_available() -> bool
-```
-
-检查 AI 客户端是否可用。
-
-#### analyze
-
-```python
-async analyze(
-    product_data: Dict,
-    image_paths: List[str],
-    prompt_text: str
-) -> Optional[Dict]
-```
-
-分析商品数据。
-
-**参数：**
-- `product_data`: 商品数据
-- `image_paths`: 图片路径列表
-- `prompt_text`: 分析提示词
-
-**返回：**
-- 分析结果字典
-
-#### refresh
-
-```python
-refresh() -> None
-```
-
-刷新配置（兼容原接口，实际会重新初始化 AI Bridge）。
-
-## 配置文件
-
-### config.json
+Successful output:
 
 ```json
 {
-  "ai_mode": "local_bridge",
-  "bridge_workspace": "/tmp/xianyu_ai_bridge",
-  "bridge_timeout": 300,
-  "created_at": "2026-02-13T15:00:00"
-}
-```
-
-**字段说明：**
-- `ai_mode`: AI 模式，`local_bridge` 或 `openai`
-- `bridge_workspace`: AI Bridge 工作目录
-- `bridge_timeout`: 等待 AI 分析的超时时间（秒）
-
-## 提示词格式
-
-### 标准提示词结构
-
-```
-你是世界顶级的二手交易分析专家，代号 EagleEye-V6.4。
-
-[用户自定义标准]
-
-### 输出格式
-
-必须返回以下 JSON 格式：
-{
-  "prompt_version": "EagleEye-V6.4",
-  "is_recommended": boolean,
-  "reason": "string",
-  "risk_tags": ["string"],
-  "criteria_analysis": {
-    "model_chip": { "status": "PASS/FAIL/WARNING", "comment": "string", "evidence": "string" },
-    "battery_health": { "status": "PASS/FAIL/WARNING", "comment": "string", "evidence": "string" },
-    "condition": { "status": "PASS/FAIL/WARNING", "comment": "string", "evidence": "string" },
-    "history": { "status": "PASS/FAIL/WARNING", "comment": "string", "evidence": "string" },
-    "seller_type": { 
-      "status": "PASS/FAIL/WARNING", 
-      "persona": "string",
-      "comment": "string",
-      "analysis_details": {}
-    },
-    "shipping": { "status": "PASS/FAIL/WARNING", "comment": "string", "evidence": "string" },
-    "seller_credit": { "status": "PASS/FAIL/WARNING", "comment": "string", "evidence": "string" }
-  }
-}
-```
-
-## 使用示例
-
-### 作为 AI 实例分析商品
-
-```python
-from ai_bridge import get_bridge
-import json
-
-# 获取桥接实例
-bridge = get_bridge()
-
-# 获取待处理请求
-pending = bridge.list_pending_requests()
-for request_id in pending:
-    request = bridge.get_analysis_request(request_id)
-    
-    # 分析商品（这里由 AI 完成）
-    product_data = request['product_data']
-    images = request['images_base64']
-    criteria = request['prompt_text']
-    
-    # 构建分析结果（AI 的分析输出）
-    result = {
-        "prompt_version": "EagleEye-V6.4",
-        "is_recommended": True,
-        "reason": "...",
-        "risk_tags": [],
-        "criteria_analysis": { ... }
+  "ok": true,
+  "keyword": "iPhone",
+  "count": 1,
+  "pages_scraped": 2,
+  "items": [
+    {
+      "id": "123",
+      "title": "listing title",
+      "price": 4999,
+      "url": "https://www.goofish.com/item?id=123",
+      "image": "https://...",
+      "location": "上海",
+      "seller": "nickname",
+      "publish_time": "2026-07-24 12:30",
+      "wants": "5",
+      "tags": ["包邮"]
     }
-    
-    # 保存结果
-    bridge.save_analysis_result(request_id, result)
+  ]
+}
 ```
+
+Failure output:
+
+```json
+{
+  "ok": false,
+  "keyword": "iPhone",
+  "error": "reason",
+  "error_type": "SearchRejectedError"
+}
+```
+
+Valid empty searches return `"ok": true` with an empty `items` array. Rejected or
+unreadable responses return `"ok": false`.
+
+## `task_manager.py`
+
+Always pass `--data-file` before the subcommand.
+
+```bash
+python scripts/task_manager.py --data-file TASKS create KEYWORD [OPTIONS]
+python scripts/task_manager.py --data-file TASKS list [--running]
+python scripts/task_manager.py --data-file TASKS stop TASK_ID
+python scripts/task_manager.py --data-file TASKS resume TASK_ID
+python scripts/task_manager.py --data-file TASKS reset-seen TASK_ID
+python scripts/task_manager.py --data-file TASKS delete TASK_ID
+```
+
+Create options:
+
+```text
+--min-price
+--max-price
+--location
+--criteria
+--pages
+--retries
+--state
+--allow-duplicate
+```
+
+Task IDs use random UUID fragments. Writes use a lock and atomic replacement.
+Existing version-1 task files are normalized when loaded.
+
+`seen_item_ids` retains the most recent 50,000 IDs. `last_results` retains at
+most 100 listings.
+
+## `monitor.py`
+
+Run one or every active task:
+
+```text
+--tasks-file       Task JSON path
+--task-id          Run only one task; omit for all active tasks
+--state            Override the task state path
+--proxy            Proxy URL; credentials are not logged
+--browser-channel  Optional Playwright channel
+--headed           Show the browser
+--include-seen      Return all matches instead of only new listings
+--baseline          Store current matches as seen and report zero new listings
+```
+
+The top-level `new_count` is the sum of new items across tasks. Any failed task
+sets top-level `"ok": false` and causes a nonzero exit.
+
+Run `--baseline` once before scheduling notifications. It reports
+`baseline_count` per task and keeps `new_count` at zero.
+
+## `create_state.py`
+
+Accept exactly one input method:
+
+```text
+--cookie-stdin     Preferred; read a Cookie header from stdin
+--cookie-file      Read the Cookie header from a local text file
+--cookie, -c       Legacy and insecure; visible to process inspection
+```
+
+Use `--output` to select the JSON path and `--force` to replace an existing
+file. The output is atomic and uses `0600` permissions where supported.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Operation succeeded |
+| `2` | Validation, authentication, risk-control, browser, or task failure |
+
+Diagnostic logs go to stderr. Machine-readable JSON goes to stdout.
