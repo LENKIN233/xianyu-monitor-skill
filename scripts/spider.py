@@ -168,7 +168,7 @@ class SearchResponseCollector:
             return await asyncio.wait_for(
                 self._queue.get(), timeout=max(timeout_ms, 1) / 1000
             )
-        except TimeoutError as exc:
+        except asyncio.TimeoutError as exc:
             raise SearchCaptureError("timed out waiting for Xianyu search API") from exc
 
 
