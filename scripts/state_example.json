@@ -2,23 +2,22 @@
   "cookies": [
     {
       "name": "_tb_token_",
-      "value": "your_token_here",
+      "value": "replace-with-your-own-value",
       "domain": ".goofish.com",
-      "path": "/"
+      "path": "/",
+      "httpOnly": false,
+      "secure": true,
+      "sameSite": "Lax"
     },
     {
       "name": "cookie2",
-      "value": "your_cookie2_here",
+      "value": "replace-with-your-own-value",
       "domain": ".goofish.com",
-      "path": "/"
+      "path": "/",
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
     }
   ],
-  "origins": [
-    {
-      "origin": "https://www.goofish.com",
-      "localStorage": [
-        {"name": "_m_h5_tk", "value": "your_token"}
-      ]
-    }
-  ]
+  "origins": []
 }

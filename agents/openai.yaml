@@ -1,0 +1,4 @@
+interface:
+  display_name: "Xianyu Monitor"
+  short_description: "Search and monitor Xianyu listings safely"
+  default_prompt: "Use $xianyu-monitor to find and monitor Xianyu listings matching my criteria."

@@ -1,395 +1,164 @@
-# Xianyu Monitor - AI Native Edition
+# Xianyu Monitor Skill
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Playwright](https://img.shields.io/badge/playwright-1.40+-green.svg)](https://playwright.dev/)
+一个轻量、可审计的闲鱼搜索与监控 Skill。通过 Playwright 使用用户自己的登录状态，
+支持真实翻页、价格/地区过滤、任务持久化、跨次去重，以及 OpenClaw 定时运行。
 
-[English](#english) | [中文](#中文)
+> 本项目只负责搜索、去重和结构化输出，不会自动购买、联系卖家或替用户做真实性保证。
 
----
+## 这次重构解决了什么
 
-<a name="english"></a>
+- 精确捕获搜索 POST 接口，不再误匹配 `.search.shade`。
+- 使用页面的下一页按钮，不再重复请求第一页。
+- 价格和地区在本地严格过滤，不依赖闲鱼忽略的 URL 参数。
+- 新增 `monitor.py`，把任务、执行记录和新商品去重串成完整闭环。
+- Cookie 与任务文件使用原子写入和 `0600` 权限。
+- 代理日志自动隐藏用户名和密码。
+- 移除 `--no-sandbox`、`--disable-web-security` 和不稳定 Canvas 噪声。
+- 更新到当前 OpenClaw `--every/--cron + --message` 调度方式。
+- 增加 pytest、Ruff 和 GitHub Actions。
+
+## 安装
+
+需要 Python 3.10+。
+
+```bash
+mkdir -p ~/.openclaw/workspace/skills
+git clone \
+  https://github.com/LENKIN233/xianyu-monitor-skill.git \
+  ~/.openclaw/workspace/skills/xianyu-monitor
+cd ~/.openclaw/workspace/skills/xianyu-monitor
+
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+openclaw skills list
+```
+
+如果只使用 CLI，可以克隆到任意目录。作为 OpenClaw Skill 使用时，应放在已配置的
+skills root 下；安装后新开会话或重启 Gateway，确保隔离任务能够解析
+`$xianyu-monitor`。
+
+## 登录状态
+
+推荐使用浏览器扩展导出的 Playwright storage state。项目同时兼容原
+`ai-goofish-monitor` 扩展的标准和增强快照。
+
+如果只有 Cookie Header，可从标准输入安全生成：
+
+```bash
+python scripts/create_state.py \
+  --cookie-stdin \
+  --output /absolute/private/path/xianyu-state.json
+```
+
+粘贴 Cookie 后发送 EOF。避免使用 `--cookie "..."`，因为参数可能进入 shell 历史。
+浏览器扩展导出的文件也应执行 `chmod 600 /absolute/path/to/state.json`。
+
+## 单次搜索
+
+```bash
+python scripts/spider.py \
+  --keyword "iPhone 15 Pro" \
+  --min-price 3500 \
+  --max-price 5500 \
+  --location "上海" \
+  --pages 2 \
+  --state /absolute/private/path/xianyu-state.json
+```
+
+成功输出：
+
+```json
+{
+  "ok": true,
+  "keyword": "iPhone 15 Pro",
+  "count": 2,
+  "pages_scraped": 2,
+  "items": []
+}
+```
+
+登录失效、风控或网络失败会输出 `"ok": false` 并返回非零退出码，不会伪装成
+“0 个商品”。
+
+## 持久监控
+
+创建任务：
+
+```bash
+python scripts/task_manager.py \
+  --data-file /absolute/private/path/tasks.json \
+  create "MacBook Air M2" \
+  --max-price 6000 \
+  --location "上海" \
+  --pages 2 \
+  --state /absolute/private/path/xianyu-state.json
+```
+
+运行所有活跃任务：
+
+```bash
+python scripts/monitor.py \
+  --tasks-file /absolute/private/path/tasks.json \
+  --baseline
+```
+
+先用 `--baseline` 静默记录当前存量商品。之后去掉该参数运行，脚本只输出之前没见过的
+商品 ID。
+
+## OpenClaw 定时任务
+
+```bash
+openclaw cron add \
+  --name "xianyu-monitor" \
+  --every 2h \
+  --session isolated \
+  --message 'Use $xianyu-monitor to run all active tasks from /absolute/private/path/tasks.json. Analyze and report only newly observed listings. If new_count is zero, return HEARTBEAT_OK with no prose. Report failures plainly.' \
+  --announce
+```
+
+`--announce` 需要已有可用投递目标；没有“最近会话”或存在多个渠道时，按 OpenClaw
+配置补充 `--channel CHANNEL --to TARGET`。
+
+固定时间可改用：
+
+```bash
+openclaw cron add \
+  --name "xianyu-daily" \
+  --cron "0 9,21 * * *" \
+  --tz "Asia/Shanghai" \
+  --session isolated \
+  --message 'Use $xianyu-monitor to run all active tasks and report only new listings. If new_count is zero, return HEARTBEAT_OK with no prose.' \
+  --announce
+```
+
+## 开发与验证
+
+```bash
+python -m pip install -r requirements-dev.txt
+ruff check .
+ruff format --check .
+pytest
+```
+
+## 安全说明
+
+- 登录状态相当于账号凭证，不要上传、截图或发给他人。
+- 建议监控间隔不少于 30 分钟。
+- 遇到 `SearchRejectedError` 应停止重试并等待账号冷却。
+- AI 只能依据抓取字段分析；卖家信用、维修史、真伪和实际成色需要人工核验。
+- 请遵守闲鱼服务条款和当地法律。本项目仅供学习与个人辅助使用。
+
 ## English
 
-### Overview
-
-**Xianyu Monitor** is an AI-native intelligent monitoring robot for Xianyu (Goofish), China's largest second-hand trading platform. Unlike traditional monitoring tools that require complex Web UI and database setup, this skill allows you to monitor products through natural language conversations with your AI assistant.
-
-**Key Features:**
-- 🤖 **AI-Native**: No Web UI, no database, just talk to your AI
-- 🔒 **Login State Support**: Bypass anti-scraping with real browser login state
-- ⏰ **Scheduled Monitoring**: Set up cron jobs for automatic monitoring
-- 🛡️ **Anti-Detection**: Built-in multiple anti-scraping measures
-- 📱 **Mobile Simulation**: Mimics real mobile devices to avoid detection
-
-### Original Project
-
-This skill is inspired by and based on the architecture of [ai-goofish-monitor](https://github.com/Usagi-org/ai-goofish-monitor) by Usagi-org. The original project is a full-featured monitoring system with Web UI, database, and Docker support.
-
-**Differences from Original:**
-
-| Feature | Original Project | This Skill |
-|---------|-----------------|------------|
-| Web UI | ✅ Yes | ❌ No (AI-controlled) |
-| Database | ✅ Yes | ❌ No (JSON files) |
-| Deployment | Complex (Docker) | **Simple** (Python only) |
-| AI Role | External API | **Direct Control** |
-| Interaction | Web interface | **Natural language** |
-| Scheduling | APScheduler | **OpenClaw Cron** |
-
-### Prerequisites
-
-#### System Requirements
-- Python 3.8 or higher
-- Windows/macOS/Linux
-
-#### Python Dependencies
-```bash
-pip install playwright requests
-playwright install chromium
-```
-
-#### Chrome Extension (Required for Login State)
-
-You need to install the Chrome extension from the original project to extract login state:
-
-1. **Download Extension**
-   ```bash
-   git clone https://github.com/Usagi-org/ai-goofish-monitor.git
-   cd ai-goofish-monitor/chrome-extension
-   ```
-
-2. **Install in Chrome**
-   - Open Chrome and navigate to `chrome://extensions/`
-   - Enable "Developer mode" (top right corner)
-   - Click "Load unpacked"
-   - Select the `chrome-extension` folder
-
-3. **Extract Login State**
-   - Go to [https://www.goofish.com](https://www.goofish.com) and log in
-   - Click the extension icon in Chrome toolbar
-   - Click "Extract Login State"
-   - Copy the JSON and save as `state.json`
-
-**Alternative: Manual Cookie Method**
-
-If you prefer not to use the extension:
-```bash
-python scripts/create_state.py --cookie "your_cookie_string" --output state.json
-```
-
-### Quick Start
-
-#### 1. Clone This Repository
-```bash
-git clone https://github.com/YOUR_USERNAME/xianyu-monitor-skill.git
-cd xianyu-monitor-skill
-```
-
-#### 2. Install Dependencies
-```bash
-pip install playwright requests
-playwright install chromium
-```
-
-#### 3. Prepare Login State
-Place your `state.json` (extracted using Chrome extension) in the project root.
-
-#### 4. Start Monitoring
-
-**Method 1: Direct Conversation with AI**
-```
-User: "帮我监控 Surface Laptop Studio，预算6000元"
-AI:  [Executes spider.py and analyzes results]
-```
-
-**Method 2: Command Line**
-```bash
-# Basic search
-python scripts/spider.py \
-  --keyword "iPhone 14 Pro" \
-  --max-price 5000 \
-  --state ./state.json
-
-# With proxy (recommended for frequent use)
-python scripts/spider.py \
-  --keyword "MacBook Air" \
-  --max-price 6000 \
-  --state ./state.json \
-  --proxy "http://127.0.0.1:7890"
-```
-
-### Scheduled Monitoring
-
-Set up automatic monitoring using OpenClaw Cron:
-
-```bash
-# Check every 2 hours
-openclaw cron add \
-  --name "xianyu-monitor" \
-  --schedule "every 2h" \
-  --command "监控 Surface Laptop，预算6000，登录状态在 ./state.json"
-
-# Daily at 9 AM and 9 PM
-openclaw cron add \
-  --name "xianyu-daily" \
-  --schedule "0 9,21 * * *" \
-  --command "检查 iPhone 的新商品"
-```
-
-### Anti-Detection Measures
-
-This skill includes multiple anti-scraping protections:
-
-| Measure | Description |
-|---------|-------------|
-| Random User-Agent | Rotates 5 real device UAs |
-| Random Viewport | Simulates different screen sizes |
-| Request Delays | 5-10s random intervals |
-| Canvas Fingerprinting | Adds noise to prevent tracking |
-| Retry Mechanism | Exponential backoff on failures |
-| Proxy Support | HTTP/HTTPS/SOCKS5 compatible |
-
-### File Structure
-
-```
-xianyu-monitor/
-├── SKILL.md                    # Detailed documentation
-├── README.md                   # This file
-├── scripts/
-│   ├── spider.py              # Core scraper (300 lines)
-│   ├── task_manager.py        # Task management
-│   ├── create_state.py        # Login state generator
-│   └── state_example.json     # Example login state
-├── references/
-│   ├── architecture.md        # Architecture documentation
-│   └── api_reference.md       # API documentation
-├── state.json                 # Your login state (user data)
-└── tasks.json                 # Your tasks (user data)
-```
-
-### Troubleshooting
-
-#### Getting 0 Results
-**Cause**: Login state expired  
-**Solution**: Re-extract login state using Chrome extension
-
-#### HTTP 403/429 Errors
-**Cause**: Rate limited by Xianyu  
-**Solution**: 
-- Wait 24 hours
-- Use a proxy: `--proxy "http://proxy:port"`
-- Reduce frequency to 30+ minutes
-
-#### Playwright Not Found
-```bash
-pip install playwright
-playwright install chromium
-```
-
-### Acknowledgments
-
-- Original project: [ai-goofish-monitor](https://github.com/Usagi-org/ai-goofish-monitor) by Usagi-org
-- Chrome extension for login state extraction from original project
-- Built for [OpenClaw](https://github.com/openclaw/openclaw) AI assistant platform
-
-### License
-
-MIT License - See [LICENSE](LICENSE) file
-
----
-
-<a name="中文"></a>
-## 中文
-
-### 项目简介
-
-**闲鱼监控助手**（Xianyu Monitor）是一个 AI 原生的闲鱼智能监控机器人。不同于传统的监控工具需要复杂的 Web UI 和数据库配置，本 Skill 让你可以通过与 AI 对话来完成商品监控任务。
-
-**核心特性：**
-- 🤖 **AI 原生**：无需 Web UI，无需数据库，直接对话即可
-- 🔒 **登录状态支持**：使用真实浏览器登录状态绕过反爬
-- ⏰ **定时监控**：支持 Cron 定时任务自动监控
-- 🛡️ **反反爬**：内置多层反检测机制
-- 📱 **移动模拟**：模拟真实手机设备避免检测
-
-### 原项目
-
-本 Skill 基于 [ai-goofish-monitor](https://github.com/Usagi-org/ai-goofish-monitor) 的架构设计，感谢 Usagi-org 的开源贡献。原项目是一个功能完整的监控系统，包含 Web UI、数据库和 Docker 支持。
-
-**与原项目的区别：**
-
-| 特性 | 原项目 | 本 Skill |
-|-----|-------|---------|
-| Web UI | ✅ 有 | ❌ 无（AI控制） |
-| 数据库 | ✅ 有 | ❌ 无（JSON文件） |
-| 部署方式 | 复杂（Docker） | **简单**（仅Python） |
-| AI 角色 | 外部 API | **直接控制** |
-| 交互方式 | 网页界面 | **自然语言对话** |
-| 定时监控 | APScheduler | **OpenClaw Cron** |
-
-### 环境要求
-
-#### 系统要求
-- Python 3.8 或更高版本
-- Windows/macOS/Linux
-
-#### Python 依赖
-```bash
-pip install playwright requests
-playwright install chromium
-```
-
-#### Chrome 扩展（必需，用于获取登录状态）
-
-你需要安装原项目提供的 Chrome 扩展来提取登录状态：
-
-1. **下载扩展**
-   ```bash
-   git clone https://github.com/Usagi-org/ai-goofish-monitor.git
-   cd ai-goofish-monitor/chrome-extension
-   ```
-
-2. **安装到 Chrome**
-   - 打开 Chrome，访问 `chrome://extensions/`
-   - 开启右上角"开发者模式"
-   - 点击"加载已解压的扩展程序"
-   - 选择 `chrome-extension` 文件夹
-
-3. **提取登录状态**
-   - 访问 [https://www.goofish.com](https://www.goofish.com) 并登录
-   - 点击 Chrome 工具栏上的扩展图标
-   - 点击"提取登录状态"
-   - 复制 JSON 并保存为 `state.json`
-
-**替代方案：手动 Cookie 方法**
-
-如果不想使用扩展：
-```bash
-python scripts/create_state.py --cookie "your_cookie_string" --output state.json
-```
-
-### 快速开始
-
-#### 1. 克隆仓库
-```bash
-git clone https://github.com/YOUR_USERNAME/xianyu-monitor-skill.git
-cd xianyu-monitor-skill
-```
-
-#### 2. 安装依赖
-```bash
-pip install playwright requests
-playwright install chromium
-```
-
-#### 3. 准备登录状态
-将用 Chrome 扩展提取的 `state.json` 放到项目根目录。
-
-#### 4. 开始监控
-
-**方式一：直接与 AI 对话**
-```
-用户："帮我监控 Surface Laptop Studio，预算6000元"
-AI：  [执行 spider.py 并分析结果]
-```
-
-**方式二：命令行**
-```bash
-# 基础搜索
-python scripts/spider.py \
-  --keyword "iPhone 14 Pro" \
-  --max-price 5000 \
-  --state ./state.json
-
-# 使用代理（频繁使用时推荐）
-python scripts/spider.py \
-  --keyword "MacBook Air" \
-  --max-price 6000 \
-  --state ./state.json \
-  --proxy "http://127.0.0.1:7890"
-```
-
-### 定时监控
-
-使用 OpenClaw Cron 设置自动监控：
-
-```bash
-# 每2小时检查一次
-openclaw cron add \
-  --name "xianyu-monitor" \
-  --schedule "every 2h" \
-  --command "监控 Surface Laptop，预算6000，登录状态在 ./state.json"
-
-# 每天上午9点和晚上9点检查
-openclaw cron add \
-  --name "xianyu-daily" \
-  --schedule "0 9,21 * * *" \
-  --command "检查 iPhone 的新商品"
-```
-
-### 反反爬措施
-
-本 Skill 包含多种反爬虫保护：
-
-| 措施 | 说明 |
-|-----|------|
-| 随机 User-Agent | 轮换5种真实设备 UA |
-| 随机视口 | 模拟不同屏幕尺寸 |
-| 请求延迟 | 5-10秒随机间隔 |
-| Canvas 混淆 | 添加噪声防止追踪 |
-| 重试机制 | 失败后指数退避 |
-| 代理支持 | 支持 HTTP/HTTPS/SOCKS5 |
-
-### 文件结构
-
-```
-xianyu-monitor/
-├── SKILL.md                    # 详细文档
-├── README.md                   # 本文件
-├── scripts/
-│   ├── spider.py              # 核心爬虫（300行）
-│   ├── task_manager.py        # 任务管理
-│   ├── create_state.py        # 登录状态生成
-│   └── state_example.json     # 登录状态示例
-├── references/
-│   ├── architecture.md        # 架构文档
-│   └── api_reference.md       # API文档
-├── state.json                 # 你的登录状态（用户数据）
-└── tasks.json                 # 你的任务（用户数据）
-```
-
-### 常见问题
-
-#### 返回 0 个结果
-**原因**：登录状态过期  
-**解决**：使用 Chrome 扩展重新提取 state.json
-
-#### HTTP 403/429 错误
-**原因**：被闲鱼限流  
-**解决**：
-- 等待 24 小时
-- 使用代理：`--proxy "http://proxy:port"`
-- 降低频率到 30 分钟以上
-
-#### 找不到 Playwright
-```bash
-pip install playwright
-playwright install chromium
-```
-
-### 致谢
-
-- 原项目：[ai-goofish-monitor](https://github.com/Usagi-org/ai-goofish-monitor) by Usagi-org
-- 用于提取登录状态的 Chrome 扩展来自原项目
-- 为 [OpenClaw](https://github.com/openclaw/openclaw) AI 助手平台构建
-
-### 许可证
-
-MIT License - 详见 [LICENSE](LICENSE) 文件
-
----
-
-**Disclaimer**: This tool is for educational purposes only. Please comply with Xianyu's Terms of Service and use responsibly.
-
-**免责声明**：本工具仅供学习交流使用，请遵守闲鱼服务条款，合理使用。
+Xianyu Monitor is a small Playwright-based skill for one-time Xianyu searches and
+recurring listing alerts. It supports authenticated browser state, real
+pagination, strict local filters, persistent deduplication, current OpenClaw
+scheduling, tests, and CI. See `SKILL.md` for the agent workflow and
+`references/api_reference.md` for CLI contracts.
+
+## License
+
+MIT. The project was inspired by
+[Usagi-org/ai-goofish-monitor](https://github.com/Usagi-org/ai-goofish-monitor).
