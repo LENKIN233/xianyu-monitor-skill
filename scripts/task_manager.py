@@ -68,6 +68,14 @@ class TaskManager:
         self.tasks: list[dict[str, Any]] = []
         self._load()
 
+    def _resolve_state_file(self, state_file: str | None) -> str | None:
+        if not state_file:
+            return None
+        state_path = Path(str(state_file)).expanduser()
+        if not state_path.is_absolute():
+            state_path = self.data_file.parent / state_path
+        return os.path.abspath(state_path)
+
     def _normalize_task(self, task: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(task)
         normalized.setdefault("id", f"task_{uuid.uuid4().hex[:12]}")
@@ -79,6 +87,17 @@ class TaskManager:
         normalized.setdefault("pages", 1)
         normalized.setdefault("retries", 3)
         normalized.setdefault("state_file", None)
+        state_file = normalized["state_file"]
+        if state_file:
+            state_path = Path(str(state_file)).expanduser()
+            # New tasks are made absolute before normalization. Preserve a
+            # legacy relative value so an upgrade never silently redirects it
+            # from the scheduler's old working directory to another file.
+            normalized["state_file"] = (
+                os.path.abspath(state_path)
+                if state_path.is_absolute()
+                else str(state_file)
+            )
         normalized.setdefault("status", "running")
         normalized.setdefault("created_at", _now())
         normalized.setdefault("updated_at", normalized["created_at"])
@@ -164,6 +183,10 @@ class TaskManager:
         max_price: float | None,
         min_price: float | None,
         location: str | None,
+        criteria: str,
+        pages: int,
+        retries: int,
+        state_file: str | None,
     ) -> dict[str, Any] | None:
         for task in self.tasks:
             if (
@@ -171,6 +194,10 @@ class TaskManager:
                 and task.get("max_price") == max_price
                 and task.get("min_price") == min_price
                 and task.get("location") == location
+                and task.get("criteria", "") == criteria
+                and int(task.get("pages", 1)) == pages
+                and int(task.get("retries", 3)) == retries
+                and task.get("state_file") == state_file
                 and task.get("status") == "running"
             ):
                 return task
@@ -197,11 +224,19 @@ class TaskManager:
             raise ValueError("pages must be at least 1")
         if retries < 1:
             raise ValueError("retries must be at least 1")
+        state_file = self._resolve_state_file(state_file)
 
         with self._mutation():
             if skip_duplicate:
                 existing = self._find_existing_task(
-                    keyword, max_price, min_price, location
+                    keyword,
+                    max_price,
+                    min_price,
+                    location,
+                    criteria,
+                    pages,
+                    retries,
+                    state_file,
                 )
                 if existing:
                     result = copy.deepcopy(existing)
@@ -374,10 +409,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             result = {"updated": manager.reset_seen(args.task_id)}
     except (KeyError, OSError, TimeoutError, ValueError) as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=True))
         return 2
 
-    print(json.dumps({"ok": True, "result": result}, ensure_ascii=False, indent=2))
+    print(json.dumps({"ok": True, "result": result}, ensure_ascii=True, indent=2))
     return 0
 
 

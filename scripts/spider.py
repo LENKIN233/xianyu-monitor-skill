@@ -13,14 +13,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 try:
     from playwright.async_api import (
         BrowserContext,
         Page,
-        Playwright,
         Route,
         async_playwright,
     )
@@ -33,7 +32,6 @@ try:
 except ImportError:  # Keep the module importable for setup/help commands.
     BrowserContext = Any
     Page = Any
-    Playwright = Any
     Route = Any
     PlaywrightError = Exception
     PlaywrightTimeoutError = TimeoutError
@@ -49,6 +47,7 @@ NEXT_PAGE_SELECTOR = (
     ":not([disabled])"
 )
 DEFAULT_TIMEOUT_MS = 30_000
+PAGINATION_WAIT_MS = 5_000
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -66,6 +65,10 @@ class StateFileError(SpiderError):
 
 class SearchRejectedError(SpiderError):
     """Raised when Xianyu rejects a search request."""
+
+
+class SearchCaptureError(SpiderError):
+    """Raised when a page does not emit the expected search request."""
 
 
 @dataclass(frozen=True)
@@ -98,7 +101,7 @@ class RateLimiter:
 
 
 class SearchResponseCollector:
-    """Capture only the exact POST search endpoint.
+    """Capture only the exact GET or POST search endpoint.
 
     Routing the request keeps the response body available even when Chromium's
     DevTools response cache discards it before an asynchronous event callback
@@ -113,7 +116,7 @@ class SearchResponseCollector:
 
     async def _handle_route(self, route: Route) -> None:
         request = route.request
-        if request.method.upper() != "POST":
+        if request.method.upper() not in {"GET", "POST"}:
             await route.continue_()
             return
 
@@ -129,6 +132,15 @@ class SearchResponseCollector:
                         status=response.status,
                         payload=None,
                         error=f"search API returned invalid JSON: {exc}",
+                    )
+                )
+                return
+            if not isinstance(payload, dict):
+                await self._queue.put(
+                    CapturedSearchResponse(
+                        status=response.status,
+                        payload=None,
+                        error="search API returned a non-object JSON payload",
                     )
                 )
                 return
@@ -157,21 +169,64 @@ class SearchResponseCollector:
                 self._queue.get(), timeout=max(timeout_ms, 1) / 1000
             )
         except TimeoutError as exc:
-            raise SpiderError("timed out waiting for Xianyu search API") from exc
+            raise SearchCaptureError("timed out waiting for Xianyu search API") from exc
+
+
+def build_proxy_settings(proxy: str) -> dict[str, str]:
+    """Convert a proxy URL into Playwright's credential-safe launch shape."""
+
+    raw = proxy.strip()
+    if not raw:
+        raise ValueError("proxy URL must not be empty")
+    candidate = raw if "://" in raw else f"http://{raw}"
+    parsed = urlsplit(candidate)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https", "socks5"}:
+        raise ValueError("proxy scheme must be http, https, or socks5")
+    if not parsed.hostname:
+        raise ValueError("proxy URL must include a host")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("proxy URL must not include a path, query, or fragment")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("proxy URL has an invalid port") from exc
+
+    has_credentials = parsed.username is not None or parsed.password is not None
+    if scheme == "socks5" and has_credentials:
+        raise ValueError("Playwright does not support authenticated SOCKS5 proxies")
+
+    server_netloc = parsed.netloc.rsplit("@", 1)[-1]
+    settings = {"server": f"{scheme}://{server_netloc}"}
+    if parsed.username is not None:
+        settings["username"] = unquote(parsed.username)
+    if parsed.password is not None:
+        settings["password"] = unquote(parsed.password)
+    return settings
 
 
 def _redact_proxy(proxy: str) -> str:
     """Return a proxy label that never includes credentials."""
 
-    parsed = urlsplit(proxy)
-    if not parsed.hostname:
+    try:
+        return build_proxy_settings(proxy)["server"]
+    except ValueError:
         return "<configured proxy>"
-    host = parsed.hostname
-    if ":" in host:
-        host = f"[{host}]"
-    port = f":{parsed.port}" if parsed.port else ""
-    scheme = f"{parsed.scheme}://" if parsed.scheme else ""
-    return f"{scheme}{host}{port}"
+
+
+def resolve_proxy(proxy: str | None, proxy_file: str | None = None) -> str | None:
+    """Resolve proxy input without requiring credentials in process arguments."""
+
+    if proxy:
+        return proxy
+    if proxy_file:
+        path = Path(proxy_file).expanduser()
+        value = path.read_text(encoding="utf-8").strip()
+        if not value:
+            raise ValueError(f"proxy file is empty: {path.resolve()}")
+        return value
+    value = os.getenv("XIANYU_PROXY", "").strip()
+    return value or None
 
 
 def _load_state_file(
@@ -212,18 +267,9 @@ def _load_state_file(
         snapshot.get("headers") if isinstance(snapshot.get("headers"), dict) else {}
     )
     navigator = env.get("navigator") if isinstance(env.get("navigator"), dict) else {}
-    screen = env.get("screen") if isinstance(env.get("screen"), dict) else {}
     intl = env.get("intl") if isinstance(env.get("intl"), dict) else {}
 
     overrides: dict[str, Any] = {}
-    user_agent = (
-        headers.get("User-Agent")
-        or headers.get("user-agent")
-        or navigator.get("userAgent")
-    )
-    if isinstance(user_agent, str) and user_agent:
-        overrides["user_agent"] = user_agent
-
     accept_language = headers.get("Accept-Language") or headers.get("accept-language")
     if isinstance(accept_language, str) and accept_language:
         overrides["locale"] = accept_language.split(",", 1)[0].strip()
@@ -233,24 +279,6 @@ def _load_state_file(
     timezone = intl.get("timeZone")
     if isinstance(timezone, str) and timezone:
         overrides["timezone_id"] = timezone
-
-    width, height = screen.get("width"), screen.get("height")
-    if isinstance(width, (int, float)) and isinstance(height, (int, float)):
-        overrides["viewport"] = {"width": int(width), "height": int(height)}
-
-    scale = screen.get("devicePixelRatio")
-    if isinstance(scale, (int, float)) and scale > 0:
-        overrides["device_scale_factor"] = float(scale)
-
-    touch_points = navigator.get("maxTouchPoints")
-    if isinstance(touch_points, (int, float)):
-        overrides["has_touch"] = touch_points > 0
-
-    if isinstance(user_agent, str):
-        lowered = user_agent.lower()
-        overrides["is_mobile"] = any(
-            marker in lowered for marker in ("mobile", "android", "iphone")
-        )
 
     allowed_headers = {"accept", "accept-language", "cache-control", "pragma"}
     safe_headers = {
@@ -264,19 +292,100 @@ def _load_state_file(
     return storage_state, overrides, safe_headers
 
 
-def _device_context(playwright: Playwright) -> dict[str, Any]:
-    """Use a coherent built-in device profile instead of mismatched random UAs."""
+def _default_context() -> dict[str, Any]:
+    """Use a desktop context that matches Xianyu's PC search API."""
 
-    device = dict(playwright.devices["Pixel 7"])
-    device.pop("default_browser_type", None)
-    device.update(
-        {
-            "locale": "zh-CN",
-            "timezone_id": "Asia/Shanghai",
-            "color_scheme": "light",
-        }
+    return {
+        "locale": "zh-CN",
+        "timezone_id": "Asia/Shanghai",
+        "color_scheme": "light",
+        "viewport": {"width": 1440, "height": 900},
+    }
+
+
+def _context_options(
+    storage_state: dict[str, Any] | str | None,
+    overrides: dict[str, Any],
+    extra_headers: dict[str, str],
+) -> dict[str, Any]:
+    options = _default_context()
+    # The captured endpoint is the PC search API. Preserve only regional
+    # metadata from enhanced snapshots so a legacy mobile snapshot cannot
+    # silently switch the browser back to the incompatible mobile route.
+    options.update(
+        {key: overrides[key] for key in ("locale", "timezone_id") if key in overrides}
     )
-    return device
+    if storage_state:
+        options["storage_state"] = storage_state
+    if extra_headers:
+        options["extra_http_headers"] = extra_headers
+    # Playwright routes cannot reliably observe requests handled by a service
+    # worker, so blocking workers is part of the collector contract.
+    options["service_workers"] = "block"
+    return options
+
+
+def _safe_page_location(url: str) -> str:
+    parsed = urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        return "<unknown page>"
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
+def _validate_search_navigation(
+    *,
+    url: str,
+    status: int | None,
+    has_state: bool,
+) -> None:
+    if status is not None and status >= 400:
+        raise SearchRejectedError(f"Xianyu search page returned HTTP {status}")
+
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    if hostname == "passport.goofish.com" or "login" in path:
+        if has_state:
+            raise StateFileError("Xianyu rejected the supplied login state")
+        raise StateFileError("Xianyu login is required; provide --state")
+    if hostname != "www.goofish.com" or not path.startswith("/search"):
+        raise SearchRejectedError(
+            f"unexpected Xianyu search navigation: {_safe_page_location(url)}"
+        )
+
+
+async def _navigate_to_search(
+    page: Page,
+    *,
+    search_url: str,
+    timeout_ms: int,
+    has_state: bool,
+    headless: bool,
+) -> None:
+    try:
+        navigation = await page.goto(
+            search_url,
+            wait_until="domcontentloaded",
+            timeout=timeout_ms,
+        )
+    except PlaywrightTimeoutError as exc:
+        _validate_search_navigation(
+            url=page.url,
+            status=None,
+            has_state=has_state,
+        )
+        headed_hint = "; retry once with --headed" if headless else ""
+        raise SearchCaptureError(
+            "timed out loading Xianyu search page; "
+            f"final page: {_safe_page_location(page.url)}"
+            f"{headed_hint}"
+        ) from exc
+
+    _validate_search_navigation(
+        url=page.url,
+        status=navigation.status if navigation else None,
+        has_state=has_state,
+    )
 
 
 class XianyuSpider:
@@ -290,15 +399,30 @@ class XianyuSpider:
         headless: bool = True,
         browser_channel: str | None = None,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
+        verbose: bool = True,
     ):
         self.state_file = state_file
-        self.proxy = proxy
+        self.proxy_settings = build_proxy_settings(proxy) if proxy else None
         self.headless = headless
         self.browser_channel = browser_channel
         self.timeout_ms = timeout_ms
+        self.verbose = verbose
         self.rate_limiter = RateLimiter()
         self.pages_scraped = 0
         self.debug = False
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(message, file=sys.stderr)
+
+    def _safe_error_message(self, error: Exception) -> str:
+        message = str(error)
+        if self.proxy_settings:
+            for field in ("username", "password"):
+                credential = self.proxy_settings.get(field)
+                if credential:
+                    message = message.replace(credential, "<redacted>")
+        return message
 
     async def search(
         self,
@@ -325,7 +449,7 @@ class XianyuSpider:
         if min_price is not None and max_price is not None and min_price > max_price:
             raise ValueError("min_price must not exceed max_price")
 
-        last_error: Exception | None = None
+        last_error: str | None = None
         for attempt in range(max_retries):
             try:
                 items = await self._search_once(keyword, pages)
@@ -335,23 +459,27 @@ class XianyuSpider:
                     max_price=max_price,
                     location=location,
                 )
-            except (SearchRejectedError, StateFileError, DependencyError):
+            except (
+                SearchCaptureError,
+                SearchRejectedError,
+                StateFileError,
+                DependencyError,
+            ):
                 raise
             except (PlaywrightError, SpiderError) as exc:
-                last_error = exc
+                last_error = self._safe_error_message(exc)
                 if attempt >= max_retries - 1:
                     break
                 wait_seconds = min(5 * (2**attempt), 30)
-                print(
+                self._log(
                     f"[retry] search failed; retrying in {wait_seconds}s "
-                    f"({attempt + 1}/{max_retries}): {exc}",
-                    file=sys.stderr,
+                    f"({attempt + 1}/{max_retries}): {last_error}"
                 )
                 await asyncio.sleep(wait_seconds)
 
         raise SpiderError(
             f"search failed after {max_retries} attempt(s): {last_error}"
-        ) from last_error
+        ) from None
 
     async def _search_once(self, keyword: str, pages: int) -> list[dict[str, Any]]:
         if async_playwright is None:
@@ -365,9 +493,8 @@ class XianyuSpider:
             self.state_file
         )
         if not storage_state:
-            print(
-                "[warning] no login state supplied; Xianyu may require authentication",
-                file=sys.stderr,
+            self._log(
+                "[warning] no login state supplied; Xianyu may require authentication"
             )
 
         self.pages_scraped = 0
@@ -375,43 +502,54 @@ class XianyuSpider:
         seen_ids: set[str] = set()
 
         async with async_playwright() as playwright:
-            launch_kwargs: dict[str, Any] = {
-                "headless": self.headless,
-                "args": ["--disable-blink-features=AutomationControlled"],
-            }
-            if self.proxy:
-                launch_kwargs["proxy"] = {"server": self.proxy}
-                print(f"[proxy] using {_redact_proxy(self.proxy)}", file=sys.stderr)
+            launch_kwargs: dict[str, Any] = {"headless": self.headless}
+            if self.proxy_settings:
+                launch_kwargs["proxy"] = self.proxy_settings
+                self._log(f"[proxy] using {self.proxy_settings['server']}")
             if self.browser_channel:
                 launch_kwargs["channel"] = self.browser_channel
 
             browser = await playwright.chromium.launch(**launch_kwargs)
             try:
-                context_kwargs = _device_context(playwright)
-                context_kwargs.update(context_overrides)
-                if storage_state:
-                    context_kwargs["storage_state"] = storage_state
-                if extra_headers:
-                    context_kwargs["extra_http_headers"] = extra_headers
+                context_kwargs = _context_options(
+                    storage_state,
+                    context_overrides,
+                    extra_headers,
+                )
 
                 context = await browser.new_context(**context_kwargs)
                 collector = SearchResponseCollector()
                 await collector.install(context)
-                await context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', "
-                    "{get: () => undefined});"
-                )
                 page = await context.new_page()
                 page.set_default_timeout(self.timeout_ms)
 
                 search_url = f"{BASE_URL}/search?{urlencode({'q': keyword})}"
-                print(f"[search] {keyword!r}, page 1/{pages}", file=sys.stderr)
-                await page.goto(
-                    search_url,
-                    wait_until="domcontentloaded",
-                    timeout=self.timeout_ms,
+                self._log(f"[search] {keyword!r}, page 1/{pages}")
+                await _navigate_to_search(
+                    page,
+                    search_url=search_url,
+                    timeout_ms=self.timeout_ms,
+                    has_state=bool(storage_state),
+                    headless=self.headless,
                 )
-                capture = await collector.next(self.timeout_ms)
+                try:
+                    capture = await collector.next(self.timeout_ms)
+                except SearchCaptureError as exc:
+                    _validate_search_navigation(
+                        url=page.url,
+                        status=None,
+                        has_state=bool(storage_state),
+                    )
+                    headed_hint = (
+                        "; Xianyu may suppress search requests in headless mode; "
+                        "retry once with --headed"
+                        if self.headless
+                        else ""
+                    )
+                    raise SearchCaptureError(
+                        f"{exc}; final page: {_safe_page_location(page.url)}"
+                        f"{headed_hint}"
+                    ) from exc
 
                 for page_number in range(1, pages + 1):
                     page_items = self._parse_capture(capture)
@@ -442,12 +580,17 @@ class XianyuSpider:
         total_pages: int,
     ) -> CapturedSearchResponse | None:
         next_button = page.locator(NEXT_PAGE_SELECTOR).first
-        if not await next_button.count():
-            print("[pagination] reached the last page", file=sys.stderr)
+        try:
+            await next_button.wait_for(
+                state="visible",
+                timeout=min(self.timeout_ms, PAGINATION_WAIT_MS),
+            )
+        except PlaywrightTimeoutError:
+            self._log("[pagination] reached the last page")
             return None
 
         await self.rate_limiter.wait()
-        print(f"[search] requesting page {page_number}/{total_pages}", file=sys.stderr)
+        self._log(f"[search] requesting page {page_number}/{total_pages}")
         capture_task = asyncio.create_task(collector.next(self.timeout_ms))
         try:
             await next_button.scroll_into_view_if_needed()
@@ -463,13 +606,13 @@ class XianyuSpider:
 
     def _parse_capture(self, capture: CapturedSearchResponse) -> list[dict[str, Any]]:
         if capture.error:
-            raise SpiderError(capture.error)
+            raise SearchCaptureError(capture.error)
         if capture.status is None or capture.status >= 400:
             raise SearchRejectedError(
                 f"search API returned HTTP {capture.status or 'unknown'}"
             )
         if not capture.payload:
-            raise SpiderError("search API returned an empty payload")
+            raise SearchCaptureError("search API returned an empty payload")
 
         ret = capture.payload.get("ret", [])
         ret_values = ret if isinstance(ret, list) else [ret]
@@ -481,9 +624,12 @@ class XianyuSpider:
         if failures:
             raise SearchRejectedError("; ".join(failures))
 
-        result_list = capture.payload.get("data", {}).get("resultList", [])
+        data = capture.payload.get("data")
+        if not isinstance(data, dict):
+            raise SearchCaptureError("search API data is not an object")
+        result_list = data.get("resultList", [])
         if not isinstance(result_list, list):
-            raise SpiderError("search API resultList is not a list")
+            raise SearchCaptureError("search API resultList is not a list")
 
         parsed: list[dict[str, Any]] = []
         for wrapper in result_list:
@@ -524,41 +670,74 @@ class XianyuSpider:
 
     def _parse_api_item(self, wrapper: dict[str, Any]) -> dict[str, Any] | None:
         try:
-            main = wrapper.get("data", {}).get("item", {}).get("main", {})
-            ex_content = main.get("exContent", {})
-            click_args = main.get("clickParam", {}).get("args", {})
-            if not isinstance(ex_content, dict):
+            data = wrapper.get("data", {})
+            if not isinstance(data, dict):
                 return None
 
-            item_id = str(ex_content.get("itemId") or "").strip()
+            item = data.get("item")
+            main = item.get("main", {}) if isinstance(item, dict) else {}
+            nested = isinstance(main, dict) and isinstance(main.get("exContent"), dict)
+            if nested:
+                ex_content = main["exContent"]
+                click_args = main.get("clickParam", {}).get("args", {})
+            else:
+                main = data
+                ex_content = data
+                click_args = data.get("clickParam", {}).get("args", {})
+            if not isinstance(ex_content, dict):
+                return None
+            if not isinstance(click_args, dict):
+                click_args = {}
+
+            item_id = str(
+                ex_content.get("itemId") or ex_content.get("id") or ""
+            ).strip()
             if not item_id:
                 return None
 
-            price_parts = ex_content.get("price", [])
-            if isinstance(price_parts, list):
-                price_text = "".join(
-                    str(part.get("text", ""))
-                    for part in price_parts
-                    if isinstance(part, dict)
-                )
-            else:
-                price_text = str(price_parts or "")
+            price_text = self._price_text(ex_content.get("price"))
 
-            raw_link = str(main.get("targetUrl") or "")
+            raw_link = str(
+                main.get("targetUrl")
+                or main.get("itemUrl")
+                or ex_content.get("targetUrl")
+                or ""
+            )
             url = raw_link.replace("fleamarket://", f"{BASE_URL}/", 1)
             if not url:
                 url = f"{BASE_URL}/item?id={item_id}"
 
-            published = self._format_timestamp(click_args.get("publishTime"))
+            published = self._format_timestamp(
+                click_args.get("publishTime") or ex_content.get("publishTime")
+            )
             tags: list[str] = []
             if click_args.get("tag") == "freeship":
                 tags.append("包邮")
-            tag_list = ex_content.get("fishTags", {}).get("r1", {}).get("tagList", [])
+            fish_tags = ex_content.get("fishTags")
+            if isinstance(fish_tags, dict):
+                rank_one = fish_tags.get("r1")
+                tag_list = (
+                    rank_one.get("tagList", []) if isinstance(rank_one, dict) else []
+                )
+            elif isinstance(fish_tags, list):
+                tag_list = fish_tags
+            else:
+                tag_list = []
             if isinstance(tag_list, list):
                 for tag_item in tag_list:
-                    if not isinstance(tag_item, dict):
-                        continue
-                    content = str(tag_item.get("data", {}).get("content", ""))
+                    if isinstance(tag_item, dict):
+                        tag_data = tag_item.get("data")
+                        content = str(
+                            (
+                                tag_data.get("content")
+                                if isinstance(tag_data, dict)
+                                else None
+                            )
+                            or tag_item.get("content")
+                            or ""
+                        )
+                    else:
+                        content = str(tag_item)
                     if "验货宝" in content and "验货宝" not in tags:
                         tags.append("验货宝")
 
@@ -568,14 +747,33 @@ class XianyuSpider:
                 "price": self._parse_price(price_text),
                 "url": url,
                 "image": str(ex_content.get("picUrl") or ""),
-                "location": str(ex_content.get("area") or ""),
-                "seller": str(ex_content.get("userNickName") or ""),
+                "location": str(ex_content.get("area") or ex_content.get("city") or ""),
+                "seller": str(
+                    ex_content.get("userNickName") or ex_content.get("userNick") or ""
+                ),
                 "publish_time": published,
-                "wants": click_args.get("wantNum", 0),
+                "wants": click_args.get("wantNum", ex_content.get("wantNum", 0)),
                 "tags": tags,
             }
         except (AttributeError, TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _price_text(raw_price: Any) -> str:
+        if isinstance(raw_price, list):
+            return "".join(
+                str(part.get("text", ""))
+                for part in raw_price
+                if isinstance(part, dict)
+            )
+        if isinstance(raw_price, dict):
+            return str(
+                raw_price.get("text")
+                or raw_price.get("price")
+                or raw_price.get("value")
+                or ""
+            )
+        return str(raw_price or "")
 
     @staticmethod
     def _parse_price(price_text: str) -> int | float | None:
@@ -611,7 +809,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--location", help="location substring")
     parser.add_argument("--pages", "-p", type=int, default=1, help="pages to fetch")
     parser.add_argument("--state", "-s", help="Playwright login-state JSON")
-    parser.add_argument("--proxy", help="HTTP(S) or SOCKS proxy URL")
+    proxy_group = parser.add_mutually_exclusive_group()
+    proxy_group.add_argument(
+        "--proxy",
+        help="HTTP(S) or SOCKS proxy URL; may be visible in process arguments",
+    )
+    proxy_group.add_argument(
+        "--proxy-file",
+        help="read proxy URL from a user-private UTF-8 file",
+    )
     parser.add_argument(
         "--browser-channel",
         default=os.getenv("XIANYU_BROWSER_CHANNEL"),
@@ -619,21 +825,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--headed", action="store_true", help="show the browser")
     parser.add_argument("--debug", action="store_true", help="enable debug metadata")
+    parser.add_argument(
+        "--quiet", action="store_true", help="suppress routine diagnostic logs"
+    )
     parser.add_argument("--retries", "-r", type=int, default=3)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    spider = XianyuSpider(
-        state_file=args.state,
-        proxy=args.proxy,
-        headless=not args.headed,
-        browser_channel=args.browser_channel,
-    )
-    spider.debug = args.debug
-
     try:
+        spider = XianyuSpider(
+            state_file=args.state,
+            proxy=resolve_proxy(args.proxy, args.proxy_file),
+            headless=not args.headed,
+            browser_channel=args.browser_channel,
+            verbose=not args.quiet,
+        )
+        spider.debug = args.debug
         results = asyncio.run(
             spider.search(
                 keyword=args.keyword,
@@ -644,7 +853,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_retries=args.retries,
             )
         )
-    except (SpiderError, ValueError) as exc:
+    except (OSError, SpiderError, ValueError) as exc:
         print(
             json.dumps(
                 {
@@ -653,7 +862,7 @@ def main(argv: list[str] | None = None) -> int:
                     "error": str(exc),
                     "error_type": type(exc).__name__,
                 },
-                ensure_ascii=False,
+                ensure_ascii=True,
             )
         )
         return 2
@@ -671,7 +880,7 @@ def main(argv: list[str] | None = None) -> int:
             "max_price": args.max_price,
             "location": args.location,
         }
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
     return 0
 
 
