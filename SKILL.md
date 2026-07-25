@@ -1,6 +1,6 @@
 ---
 name: xianyu-monitor
-description: Search and monitor Xianyu listings with login state, filters, pagination, persistent tasks, and deduplication. Use when asked to find or track listings.
+description: Search and monitor Xianyu listings with private browser state, filters, pagination, persistent tasks, and deduplication. Use when asked to find or track listings.
 ---
 
 # Xianyu Monitor
@@ -65,10 +65,12 @@ press Enter; terminal echo is disabled. Piped or redirected input ends at EOF.
 If bundled Chromium is unavailable but local Chrome is installed, pass
 `--browser-channel chrome`.
 
-## Prepare login state
+## Prepare browser state
 
 Prefer the bundled dedicated login flow. It opens a separate visible browser;
-the user must complete login, OTP, QR, and CAPTCHA interactions themselves:
+the user must complete login, OTP, QR, and CAPTCHA interactions themselves.
+They must also open the account area and visibly confirm that it is the intended
+account:
 
 ```bash
 python scripts/login_state.py \
@@ -76,16 +78,62 @@ python scripts/login_state.py \
   --output /absolute/private/path/xianyu-state.json
 ```
 
-The command never prints Cookie values, writes the state with `0600`
-permissions where supported, and refuses to overwrite unless `--force` is
-explicit. A newly created containing directory uses `0700`; a final output
-symlink is rejected. A Playwright storage-state file exported from another
-browser tool is also supported, including the original `ai-goofish-monitor`
-extension's standard and enhanced snapshots.
+The command displays a one-time `SAVE-...` confirmation in the interactive
+terminal. When it appears, the agent must pause and wait for the user to provide
+that exact confirmation; the agent must never type, pipe, infer, or reuse it for
+the user. Non-interactive input, EOF, a wrong token, a login/challenge page, a
+missing navigation display-name field, or no retained Goofish browser-storage
+material all fail without
+saving.
 
-Treat the saved file as a candidate state until one controlled search succeeds.
-Detecting the login Cookie alone does not prove that Xianyu will accept a PC
-search. Do not trigger an automatic validation search from the login command.
+After confirmation, the command opens a fresh validation page and checks for
+the current PC navigation response's nonempty display-name field. Xianyu's
+current layout uses that field as a candidate session signal, but it is an
+undocumented candidate signal, not identity proof. The value is processed only in memory and
+is not emitted or separately copied by the command. Before saving, the command
+removes all non-Goofish Cookies and origins. The remaining site-created state
+is still a credential and may encode account data, so never inspect, summarize,
+or share it. It writes with `0600` permissions where supported and refuses to
+overwrite unless `--force` is explicit. A newly created containing directory
+uses `0700`; a final output symlink is rejected.
+
+Its output keeps evidence dimensions separate:
+
+- `state.status: candidate-saved`: a private browser snapshot was saved.
+- `state.status: not-saved`: the publish is known not to have committed.
+- `state.status: not-established`: interruption or an OS error made the atomic
+  publish result unknowable. Keep the named path secret and anomalous; do not
+  inspect or use it, and do not claim that it was saved or absent.
+- `confirmation.status: interactive-token-received`: the terminal received the
+  one-time token. The program cannot determine whether the human or an agent
+  typed it.
+- `confirmation.actor: not-machine-verified`: the program cannot verify who
+  typed the token.
+- `session.nav_display_name: present`: the current Goofish PC navigation
+  response had a nonempty display-name field. This does not prove identity.
+- `authentication.status: not-established`: the command did not prove that the
+  candidate state is authenticated.
+- `identity.status: not-machine-verified`: the command did not verify which
+  account was visible.
+- `search_capability.status: not-tested`: no search was run.
+- `cleanup.status`: `failed` contains generic cleanup errors and means the
+  dedicated browser may not have fully exited; otherwise it is
+  `complete-or-not-required`.
+
+A conforming agent may attribute the confirmation to the user only after the
+user personally sends the exact token. If the user says they did not confirm,
+or the agent entered the token, treat the output and any resulting file as
+anomalous: do not use it or infer login, identity, or search capability.
+
+A later successful controlled search proves only that the browser context could
+search during that run. It never identifies the account. `RGV587` proves only
+that a request was rejected. Browser cleanup or local persistence can still
+fail after a successful search; rely on the independent capability field, not
+`ok` alone. Never promote any of these outcomes into an identity claim.
+
+A Playwright storage-state file exported from another browser tool is also
+supported, including the original `ai-goofish-monitor` extension's standard and
+enhanced snapshots. Such imported state has no user-confirmation record.
 
 Ensure the exported state is readable only by the user:
 
@@ -108,7 +156,9 @@ At an interactive terminal, paste one Cookie header line and press Enter; input
 is hidden. For a pipe or redirection, input ends at EOF. The command fails
 closed if it cannot disable terminal echo, writes atomically with `0600`
 permissions where supported, and refuses to overwrite unless `--force` is set.
-On Windows, the output inherits the containing directory's ACL.
+On Windows, the output inherits the containing directory's ACL. This creates
+only a candidate state and proves neither authentication nor identity. Apply
+the same anomalous-secret rule if it reports `state.status: not-established`.
 
 ## Run a one-time search
 
@@ -130,9 +180,9 @@ Treat a nonzero exit code or `"ok": false` as failure. Never interpret failed
 or unreadable output as “no listings.” Stop after login challenges, CAPTCHA, or
 risk-control errors; do not attempt to bypass them.
 
-If a valid login state reaches `/search` but no search API is observed in
-headless mode, retry once with `--headed`. Do not loop headed attempts or use
-anti-detection workarounds.
+If a supplied candidate state reaches `/search` but no search API is observed
+in headless mode, retry once with `--headed`. Do not loop headed attempts or
+use anti-detection workarounds.
 
 ## Analyze successful results
 
@@ -224,6 +274,18 @@ Keep scheduling and delivery outside the scraper:
 4. Parse the JSON and notify only when `new_count` is greater than zero.
 5. Surface every nonzero exit or `"ok": false` result as a failure.
 
+A nonzero result can still contain committed new items. If a task has
+`persistence.status: recorded`, retain or deliver its `items` even when the
+top-level run was cancelled or finalization failed, and surface the failure as
+well. Those IDs are already deduplicated in the task file, so dropping this
+output can lose a notification. Use an atomic local outbox when delivery must
+survive adapter failure.
+
+If persistence is `not-established` and `possible_duplicate` is true, retain
+the candidate items with at-least-once semantics and allow a later duplicate.
+The task-file replace may already have committed their IDs, so discarding them
+could lose the notification permanently.
+
 For a deterministic scheduler that treats any stdout as a notification, add
 `--quiet-if-empty`. It suppresses routine progress logs and emits no final JSON
 only after a successful run with zero new listings; errors remain visible and
@@ -244,12 +306,13 @@ operating-system scheduler.
 
 ## Troubleshoot
 
-- `SearchCaptureError`: do not retry automatically. If a valid state reached
-  `/search` in headless mode, make one explicit `--headed` attempt. Malformed
-  or intercepted API responses also use this error and should not be looped.
+- `SearchCaptureError`: do not retry automatically. If a supplied candidate
+  state reached `/search` in headless mode, make one explicit `--headed`
+  attempt. Malformed or intercepted API responses also use this error and
+  should not be looped.
 - `SearchRejectedError`: stop automatic retries and report the rejection. For
-  `RGV587`, wait for the account to cool down; do not re-login, switch proxies,
-  or retry with `--headed`.
+  `RGV587`, let the request/session cool down; identity remains unknown. Do not
+  re-login, switch proxies, or retry with `--headed`.
 - `StateFileError`: verify that the file is valid JSON with a `cookies` array.
 - Missing task file: correct the absolute path; never treat it as zero active
   tasks.

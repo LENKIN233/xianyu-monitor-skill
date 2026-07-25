@@ -1,7 +1,7 @@
 # Xianyu Monitor Skill
 
 一个遵循 [Agent Skills 开放规范](https://agentskills.io/specification) 的闲鱼搜索与监控
-Skill。核心只依赖 Python、Playwright 和闲鱼登录状态，不依赖 OpenClaw、Codex、
+Skill。核心只依赖 Python、Playwright 和闲鱼浏览器状态，不依赖 OpenClaw、Codex、
 Claude Code 或任何特定调度器。
 
 它可以作为：
@@ -21,7 +21,7 @@ Claude Code 或任何特定调度器。
 - 使用真实的下一页控件，不会重复抓取第一页。
 - 在本地严格执行价格和地区过滤。
 - 使用持久任务文件记录条件、运行结果与已见商品 ID。
-- 登录失效、风控和抓取失败会明确报错，不会伪装成“没有新商品”。
+- 观察到登录跳转或挑战、风控和抓取失败会明确报错，不会伪装成“没有新商品”。
 - Cookie、任务文件采用原子写入；POSIX 使用 `0600`，Windows 依赖私有目录 ACL。
 - 代理日志隐藏用户名和密码。
 - HTTP(S) 认证代理可通过私有文件或 `XIANYU_PROXY` 注入，不必写入命令参数。
@@ -104,14 +104,17 @@ Codex 与新版 OpenClaw 共用 `~/.agents/skills`。不支持目录软链接时
 `--mode copy`；复制模式不会带上 `.git`、虚拟环境、测试缓存或本地任务/登录文件，
 也不会覆盖已有路径。一次多宿主安装若中途失败，会回滚本次已创建的 Skill；已有
 symlink 与请求的 copy 模式不一致时会明确失败，不会伪装成复制安装成功。
+两种模式都先在同一文件系统的私有临时目录中构造，再用平台原子的
+no-replace rename 一次发布；文件系统不支持该保证时会安全失败，不退回到
+check-then-rename。
 
 各宿主的项目级安装、定时任务和注意事项见
 [references/host_adapters.md](references/host_adapters.md)。
 
-## 登录状态
+## 浏览器状态
 
 推荐使用内置登录命令。它会打开独立的可见浏览器，扫码、验证码和 CAPTCHA 必须由
-用户本人完成：
+用户本人完成；随后还必须打开账号区域，亲眼核对是预期账号：
 
 ```bash
 python scripts/login_state.py \
@@ -119,11 +122,46 @@ python scripts/login_state.py \
   --output "/absolute/private/path/xianyu-state.json"
 ```
 
-命令不会输出 Cookie，POSIX 下写入权限为 `0600`；除非明确增加 `--force`，否则不会
-覆盖已有登录态。项目也兼容其他浏览器工具导出的 Playwright storage state，以及原
-`ai-goofish-monitor` 扩展的标准和增强快照。
-命令保存的是候选登录态：检测到登录 Cookie 不等于搜索已通过。只用一次受控搜索
-验证它；验证前不要把它视为完整可用。
+命令会在交互终端显示一次性 `SAVE-...` 确认词。Agent 必须暂停并等待用户本人回复
+这个确认词，不得代输、管道注入、猜测或复用。非交互输入、EOF、错误确认词、仍在
+登录/验证/风控页面、未观察到导航响应的展示名字段，或没有保留下来的 Goofish
+浏览器存储材料时，
+都不会保存文件。
+
+确认后，命令会新开一个验证页，检查当前 PC 导航响应是否含非空展示名。闲鱼当前布局
+把它当作候选会话信号，但这是未公开承诺的候选信号，不是身份凭据。命令只在内存中判断
+展示名，不会单独输出或复制该字段。保存前会删除所有非 Goofish 域的 Cookie 和
+origin；剩余的站点状态仍是账号凭证，也可能编码账号数据，禁止查看、摘要或分享。
+POSIX 下文件权限为 `0600`；除非明确增加 `--force`，否则不会覆盖已有文件。输出中
+的证据维度相互独立：
+
+- `state.status: candidate-saved`：候选浏览器状态已安全保存；
+- `state.status: not-saved`：已确定本次没有发布状态文件；
+- `state.status: not-established`：中断或系统错误使原子发布结果无法确认；此路径必须
+  继续按异常凭据保密，不得读取、使用，也不得声称文件已保存或不存在；
+- `confirmation.status: interactive-token-received`：终端收到了确认词，但程序本身
+  无法判断输入者是用户还是 Agent；
+- `confirmation.actor: not-machine-verified`：程序不能验证是谁输入了确认词；
+- `session.nav_display_name: present`：当前 Goofish PC 导航响应含非空展示名，
+  但它不能证明具体账号身份；
+- `authentication.status: not-established`：程序没有证明该候选状态已认证；
+- `identity.status: not-machine-verified`：程序没有机器验证具体账号身份；
+- `search_capability.status: not-tested`：尚未搜索。
+- `cleanup.status`：`failed` 会列出通用清理错误，提示专用浏览器可能未完全退出；
+  否则为 `complete-or-not-required`。
+
+只有用户本人在对话中返回准确确认词时，Agent 才能把本次确认归于用户。如果用户否认
+确认，或 Agent 曾经代输确认词，必须把输出和由此产生的文件视为异常：不得使用，也
+不得推断登录、身份或搜索能力。
+
+之后一次成功的受控搜索，只能证明该浏览器上下文在当次运行能够搜索，不能证明登录
+的是哪个账号。搜索成功后，浏览器清理或本地持久化仍可能失败，因此必须分别读取
+`ok` 和能力字段。`RGV587` 也只能证明请求被拒绝，不能证明账号身份。
+
+项目兼容其他浏览器工具导出的 Playwright storage state，以及原
+`ai-goofish-monitor` 扩展的标准和增强快照；导入文件不自带用户确认记录。无论
+来源，状态在传入浏览器前都会按结构校验，并只保留 Goofish 域 Cookie 与规范的
+Goofish HTTPS origin，第三方凭据不会进入搜索上下文。
 
 如果只有 Cookie Header，从标准输入安全生成：
 
@@ -135,7 +173,8 @@ python scripts/create_state.py \
 
 交互终端会隐藏输入；粘贴一行 Cookie 后按 Enter。若通过管道或重定向传入，则以
 EOF 结束。无法关闭终端回显时命令会安全失败。避免使用 `--cookie "..."`，因为参数
-可能进入 shell 历史。
+可能进入 shell 历史。该命令只生成候选状态，不证明认证或账号身份；若输出
+`state.status: not-established`，同样按上面的异常凭据规则处理。
 浏览器扩展导出的文件也应设置为仅本人可读：
 
 ```bash
@@ -165,13 +204,17 @@ python scripts/spider.py \
   "keyword": "iPhone 15 Pro",
   "count": 2,
   "pages_scraped": 2,
-  "items": []
+  "items": [],
+  "search_capability": {"status": "passed-for-this-run"},
+  "authentication": {"status": "not-evaluated"},
+  "identity": {"status": "not-evaluated"},
+  "cleanup": {"status": "complete-or-not-required"}
 }
 ```
 
-登录失效、风控或网络失败会输出 `"ok": false` 并返回非零退出码。闲鱼返回
+观察到登录跳转或挑战、风控或网络失败会输出 `"ok": false` 并返回非零退出码。闲鱼返回
 `RGV587` 等风控错误时立即停止；不要尝试绕过登录挑战、CAPTCHA 或风控。
-如果有效登录态已进入 `/search`，但无头模式没有观察到搜索接口，只使用
+如果已提供的候选状态进入 `/search`，但无头模式没有观察到搜索接口，只使用
 `--headed` 重试一次；不要循环尝试或加入反检测绕过。
 
 ## 持久监控
@@ -223,6 +266,17 @@ python scripts/monitor.py \
 旧任务若仍保存相对登录状态路径，升级后不会被静默改指到另一文件；运行时必须显式
 传入已授权的绝对 `--state` 路径，或用绝对路径重建任务。
 
+任务搜索成功后，取消或清理失败仍可能发生在 seen-ID 已提交之后。此时顶层会
+`"ok": false` 并返回非零退出码，但对应任务会保留 `items`、`new_count` 和
+`persistence.status: recorded`。通知适配器必须既持久化/投递这些条目，又报告本次
+失败；下一次运行会去重，直接丢弃这份失败 JSON 可能漏通知。需要可靠投递时先写本地
+原子 outbox，再独立重试发送。
+
+如果任务文件的原子替换可能已发生、但提交核验失败，任务会保留候选 `items`，并输出
+`persistence.status: not-established` 与 `possible_duplicate: true`。仍应按
+at-least-once 语义进入 outbox，同时报告失败并允许后续重复；重复通知优于已提交 ID
+导致的永久漏报。
+
 任务中的 `criteria` 只是原样返回给 Agent 的自然语言分析提示，不是可执行过滤器。
 纯命令模式严格执行的条件只有关键词、价格和地区。
 
@@ -253,24 +307,30 @@ ruff format --check .
 pytest
 ```
 
-自动化测试使用模拟页面和接口，不会登录闲鱼或启动真实浏览器。发布前应在本机用专用
-测试账号和私有登录状态执行一次人工 smoke test；不要把凭据加入测试夹具或 CI。
+自动化测试使用模拟页面和接口，不会登录闲鱼或启动真实浏览器。发布前如需账号级
+smoke test，必须由用户本人在本机可见浏览器中登录并输入一次性确认词；不要把凭据
+加入测试夹具或 CI。
 
 ## 安全说明
 
 - 登录状态相当于账号凭证，不要上传、截图或发给他人。
+- 状态与任务文件应放在 checkout 之外；确需放入仓库目录时，只使用已整体忽略的
+  根目录 `private/`，不要依赖自定义文件名恰好被忽略。
+- 登录命令只在 stdout 输出一个最终 JSON；`browser-opening` 进度写入 stderr。
+- 登录命令的输出会包含私有状态文件路径；stdout/stderr 日志只保留在本机，不要上传
+  到 CI、工单或公共聊天。
 - 建议监控间隔不少于 30 分钟。
-- 遇到 `SearchCaptureError` 不会自动重试；确认登录态有效后最多手动执行一次
-  `--headed`。
-- 遇到 `SearchRejectedError` 应停止重试并报告；`RGV587` 时等待账号冷却，
-  不重新登录、不换代理，也不再用 `--headed` 尝试。
+- 遇到 `SearchCaptureError` 不会自动重试；候选状态已进入搜索页时最多手动执行
+  一次 `--headed`。
+- 遇到 `SearchRejectedError` 应停止重试并报告；`RGV587` 时让请求/会话冷却，
+  此时账号身份仍未知。不重新登录、不换代理，也不再用 `--headed` 尝试。
 - AI 只能依据抓取字段分析；卖家信用、维修史、真伪和实际成色需要人工核验。
 - 请遵守闲鱼服务条款和当地法律。本项目仅供学习与个人辅助使用。
 
 ## English
 
-Xianyu Monitor is a host-neutral Agent Skill and CLI for authenticated Xianyu
-searches and recurring listing checks. Its core is independent from Codex,
+Xianyu Monitor is a host-neutral Agent Skill and CLI for browser-state-backed
+Xianyu searches and recurring listing checks. Its core is independent from Codex,
 Claude Code, OpenClaw, schedulers, and notification transports. It provides real
 pagination, strict local filters, persistent deduplication, stable JSON, tests,
 and optional host adapters. See `SKILL.md` for the agent workflow and
