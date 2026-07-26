@@ -51,7 +51,11 @@ Successful output:
       "wants": "5",
       "tags": ["包邮"]
     }
-  ]
+  ],
+  "search_capability": {"status": "passed-for-this-run"},
+  "authentication": {"status": "not-evaluated"},
+  "identity": {"status": "not-evaluated"},
+  "cleanup": {"status": "complete-or-not-required"}
 }
 ```
 
@@ -62,21 +66,26 @@ Failure output:
   "ok": false,
   "keyword": "iPhone",
   "error": "reason",
-  "error_type": "SearchRejectedError"
+  "error_type": "SearchRejectedError",
+  "search_capability": {"status": "rejected-for-this-run"},
+  "authentication": {"status": "not-evaluated"},
+  "identity": {"status": "not-evaluated"},
+  "cleanup": {"status": "complete-or-not-required"}
 }
 ```
 
 Valid empty searches return `"ok": true` with an empty `items` array. Rejected or
 unreadable responses return `"ok": false`.
-Authentication, risk-control, invalid-state, and missing-dependency errors are
+Login challenges, risk-control, invalid-state, and missing-dependency errors are
 not retried. A missing expected search request raises `SearchCaptureError` and
 is also not retried. Other transient browser/network failures use the configured
 retry count.
-If a valid state reaches `/search` without emitting the search API in headless
-mode, make at most one explicit `--headed` attempt. Do not automate repeated
-headed attempts or add anti-detection bypasses.
-An `RGV587` rejection ends the run. Wait for the account to cool down; do not
-re-login, rotate proxies, or make a headed retry in response to that code.
+If a supplied candidate state reaches `/search` without emitting the search API
+in headless mode, make at most one explicit `--headed` attempt. Do not automate
+repeated headed attempts or add anti-detection bypasses.
+An `RGV587` rejection ends the run. Let the request/session cool down; account
+identity remains unknown. Do not re-login, rotate proxies, or make a headed
+retry in response to that code.
 
 ## `task_manager.py`
 
@@ -104,7 +113,13 @@ Create options:
 --allow-duplicate
 ```
 
-Task IDs use random UUID fragments. Writes use a lock and atomic replacement.
+Task IDs use random UUID fragments. Task JSON is built under a private
+same-filesystem directory and atomically replaced. Lock acquisition first writes
+and syncs a private same-directory anchor, then publishes the lock with a
+no-replace hard link. Filesystems without that primitive fail closed.
+Existing lock files are never deleted based on age or PID guesses; they fail
+closed with a timeout. After a crashed process, an operator must first verify
+that no task mutation is running before removing the exact `.lock` file.
 Existing version-1 task files are normalized when loaded.
 
 A successful create returns the task under `result`; use its `id` for scoped
@@ -121,6 +136,41 @@ baseline and monitor commands:
   }
 }
 ```
+
+Cancelled mutations and post-commit finalization failures keep task-file
+evidence separate from the process result:
+
+```json
+{
+  "ok": false,
+  "error": "task command cancelled",
+  "error_type": "KeyboardInterrupt",
+  "task_commit_status": "recorded",
+  "persistence": {"status": "recorded"},
+  "cleanup": {"status": "complete-or-not-required"},
+  "result": {"updated": true}
+}
+```
+
+`task_commit_status` and `persistence.status` use these values:
+
+- `recorded`: the mutation committed. Retain the returned `result` even though
+  the command failed or was cancelled.
+- `not-recorded`: the mutation is known not to have committed.
+- `not-established`: atomic-commit reconciliation failed. The output contains
+  `possible_result`; inspect the task file before deciding whether to retry.
+- `not-attempted`: no mutating command was dispatched, for example because
+  task-manager initialization failed.
+
+Every task CLI response also has independent cleanup evidence. A cleanup
+failure is reported as
+`{"cleanup":{"status":"failed","errors":["generic cleanup description"]}}`;
+otherwise the status is `complete-or-not-required`. Cleanup failure does not
+change `task_commit_status`: a mutation can be `recorded` while lock cleanup
+failed, so callers must handle both fields.
+
+For `stop`, `resume`, and `reset-seen`, `result`/`possible_result` wraps the
+boolean as `updated`; `delete` uses `deleted`; `create` returns the task object.
 
 An equivalent active task is returned with `"existing": true` unless
 `--allow-duplicate` was supplied. Equivalence includes every task-defining
@@ -185,6 +235,11 @@ Successful output has this shape:
       "matched_count": 4,
       "new_count": 1,
       "baseline_count": 0,
+      "search_capability": {"status": "passed-for-this-run"},
+      "persistence": {"status": "recorded"},
+      "authentication": {"status": "not-evaluated"},
+      "identity": {"status": "not-evaluated"},
+      "cleanup": {"status": "complete-or-not-required"},
       "items": [
         {
           "id": "123",
@@ -202,6 +257,35 @@ By default, each task's `items` contains only newly observed listings. “New”
 means an item ID not previously stored in `seen_item_ids`; edits to an already
 seen listing do not create another notification. With `--include-seen`, `items`
 contains every current match instead.
+
+Per-task `persistence.status` is independent from search capability:
+
+- `recorded`: the seen-ID/task update committed.
+- `not-recorded`: the update is known not to have committed.
+- `not-established`: atomic task-file commit status could not be established.
+  The task may retain candidate `items` and sets `possible_duplicate: true`;
+  cleanup is reported independently.
+- `not-attempted`: search did not reach persistence.
+
+Failed tasks also expose `error_recording.status` independently. `recorded`
+means `last_error` committed, `not-recorded` means it is known not to have
+committed, `not-established` means that commit could not be reconciled, and
+`not-attempted` means cleanup or an earlier interruption prevented the
+recording attempt. This field does not change search or seen-item persistence.
+
+Cancellation after a task commit exits `130` with top-level `"ok": false`, but
+the committed task remains `"ok": true`, retains its `items`/`new_count`, and
+contains `interruption.status: cancelled-after-task-commit`. A non-cancellation
+finalization failure uses task `"ok": false`,
+`finalization.status: failed`, and `persistence.status: recorded`, while also
+retaining the new items. When atomic-commit reconciliation itself fails, the
+task is `"ok": false`, retains candidate new items with
+`persistence.status: not-established` and `possible_duplicate: true`, and stops
+the batch. Consume or durably queue all retained items **and** surface the
+failure. `recorded` items will be deduplicated later; `not-established` items
+may appear again if the commit did not land, so at-least-once delivery is safer
+than permanent loss. Never start another task in the same batch after
+incomplete cleanup.
 
 Run `--baseline` once before scheduling notifications. It reports
 `baseline_count` per task and keeps `new_count` at zero.
@@ -233,11 +317,18 @@ Use `--output` to select the JSON path and `--force` to replace an existing
 file. Interactive TTY input is hidden and completes with Enter; piped or
 redirected input completes at EOF. If terminal echo cannot be disabled, the
 command fails instead of falling back to visible input. The output is atomic
-and uses `0600` permissions where supported.
+and uses `0600` permissions where supported. Output includes independent
+`state`, `authentication`, `identity`, `search_capability`, and `cleanup`
+evidence. A cookie-derived state is only `candidate-saved`;
+`authentication.status` remains `not-established`.
+Keep credential and task files outside the checkout. If an operator deliberately
+stores them inside the repository, use only its root `private/` directory, which
+is ignored as a whole; an arbitrary custom JSON filename is not a security
+boundary.
 
 ## `login_state.py`
 
-Open a dedicated visible browser and save a candidate Playwright login state:
+Open a dedicated visible browser and save a candidate Playwright browser state:
 
 ```text
 --output, -o       Required private state-file path
@@ -246,13 +337,66 @@ Open a dedicated visible browser and save a candidate Playwright login state:
 --force            Explicitly replace an existing state file
 ```
 
-The user must complete QR, OTP, password, and CAPTCHA interactions personally.
-The command detects a nonempty login Cookie without printing its value, writes
+The user must complete QR, OTP, password, and CAPTCHA interactions personally,
+open the account area, and visibly verify the intended account. The command
+then prints a random `SAVE-...` token to the interactive terminal. Agents must
+pause for the user to provide that exact token and must not enter or pipe it for
+them. Non-TTY input, EOF, a wrong token, login/challenge pages, an absent site
+navigation display-name field, and no retained Goofish browser-storage material
+fail without writing.
+
+Xianyu's current PC layout exposes that nonempty navigation field as a
+candidate session marker, but the command reports only the field's presence and
+never treats it as authentication or identity proof. The raw response can
+contain identity fields, so the command does not copy it into output or state.
+It writes only filtered Playwright state
 atomically, uses `0600` permissions where supported, creates a missing
-containing directory as `0700`, and rejects a final output symlink. Its success
-status is `candidate-state-saved`; only a later controlled successful search
-verifies that Xianyu accepts the state. Do not automate or bypass login
-challenges or risk control.
+containing directory as `0700`, and rejects a final output symlink.
+The `browser-opening` progress object goes to stderr. Stdout contains exactly one
+final success, failure, or cancellation JSON object.
+
+Success keeps evidence dimensions separate:
+
+```json
+{
+  "ok": true,
+  "state": {
+    "status": "candidate-saved",
+    "output": "/private/path/state.json"
+  },
+  "confirmation": {
+    "status": "interactive-token-received",
+    "actor": "not-machine-verified"
+  },
+  "session": {"nav_display_name": "present"},
+  "authentication": {"status": "not-established"},
+  "identity": {"status": "not-machine-verified"},
+  "search_capability": {"status": "not-tested"},
+  "cleanup": {"status": "complete-or-not-required"}
+}
+```
+
+`state.status` can also be `not-saved` when the publish is known not to have
+committed, or `not-established` when interruption or an OS error prevented the
+atomic publish status from being determined. Treat a `not-established` output
+path as a secret, anomalous candidate: do not use or inspect it, and do not
+claim it was either saved or absent.
+
+The confirmation status proves only that the interactive terminal received the
+token. If the user denies providing it, or an agent entered it, treat the output
+and any resulting file as anomalous and unusable. A successful controlled
+search later changes only search capability for that run. It does not
+machine-verify an account identity. Do not automate or bypass login challenges
+or risk control.
+
+The PC navigation response's nonempty display-name field is a candidate signal
+used by Xianyu's current layout, not identity proof. Its value is evaluated
+transiently and is not emitted or separately copied by the command. Before
+writing, the command removes all Cookies and origins outside `goofish.com`. The
+remaining site-created Goofish state is still a secret and may encode account
+data. The command's JSON and diagnostics echo the user-selected output path, so
+keep login-command logs local and never upload them with support bundles or CI
+artifacts.
 
 ## `install_skill.py`
 
@@ -272,14 +416,27 @@ fails, targets created by that same invocation are rolled back.
 
 Copy mode uses a runtime allowlist and excludes repositories, virtual
 environments, test caches, and local state. The hidden `--home` option exists
-only for isolated testing and packaging.
+only for isolated testing and packaging. Copy and symlink installs are built
+under a private same-filesystem staging path and published with the platform's
+atomic no-replace rename. If that primitive or filesystem guarantee is
+unavailable, installation fails closed instead of using a check-then-rename
+fallback.
+
+Successful and dry-run output keeps the existing `installs` records, including
+each exact `target`. If cancellation occurs, exit `130` instead emits
+path-private evidence: overall `installation.status` and each install status are
+`installed`, `not-installed`, or `not-established`, with an independent
+`cleanup` object. A `not-established` result means rollback or target
+reconciliation was incomplete; inspect the configured discovery root before
+retrying. Cancellation output intentionally omits target paths.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Operation succeeded |
-| `2` | Validation, authentication, risk-control, browser, or task failure |
+| `2` | Validation, login challenge, risk-control, browser, or task failure |
+| `130` | Operation was cancelled; inspect independent commit/cleanup evidence |
 
 Diagnostic logs go to stderr. Machine-readable JSON goes to stdout unless
 `--quiet-if-empty` suppresses a successful zero-new monitor run.

@@ -1,2 +1,2 @@
-playwright>=1.50,<2
+playwright>=1.51,<2
 tzdata>=2024.1

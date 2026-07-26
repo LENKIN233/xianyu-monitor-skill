@@ -43,22 +43,29 @@ notifications.
 
 ## Search capture
 
-The browser context installs a route only for:
+The browser context installs a route only for the canonical HTTPS endpoint:
 
 ```text
-/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/
+https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/
 ```
 
-GET and POST requests are captured; preflight and other methods continue
-normally. The handler forwards the original request, reads and validates JSON,
-then fulfills the page request with the same response and body.
+GET and POST requests are captured only after the handler independently
+revalidates the exact origin and path, decodes the MTop `data` parameter, and
+matches the requested keyword and `pageNumber`. Preflight, stale pages, other
+keywords, other origins, and malformed metadata continue normally. The handler
+forwards a matched request, reads and validates JSON, then fulfills the page
+request with the same response and body. Redirect following is disabled, so a
+canonical request cannot silently turn into a success-shaped response from a
+different origin.
 
 This prevents the broader `pc.search` substring from matching the unrelated
-`.search.shade` endpoint. Routing also avoids a Chromium DevTools race where an
-asynchronous response event can lose access to the response body.
+`.search.shade` endpoint or a lookalike origin, and prevents a stale response
+from proving the wrong page. Routing also avoids a Chromium DevTools race where
+an asynchronous response event can lose access to the response body.
 
-Non-success `ret` values become `SearchRejectedError`. A rejected request is
-never reported as a valid empty search.
+Only 2xx responses with strict `SUCCESS::` `ret` markers are accepted.
+Non-success markers or statuses become `SearchRejectedError`. A rejected
+request is never reported as a valid empty search.
 
 ## Filtering and pagination
 
@@ -103,6 +110,19 @@ failure. `last_results` supports inspection, while `reset-seen` deliberately
 replays all currently matched items and should be used only as an explicit
 recovery action.
 
+A cancellation or finalization error can occur after the seen-ID commit.
+`monitor.py` therefore retains committed `items` and `new_count` in its
+nonzero-exit JSON and marks persistence as `recorded`. Adapters must enqueue
+those items before acknowledging the run while also surfacing the nonzero
+status. Incomplete cleanup terminates the batch so no later task starts against
+uncertain browser, lock, or task-file state.
+
+If the atomic replace may have happened but file-identity reconciliation fails,
+the monitor retains the computed new items with persistence
+`not-established` and `possible_duplicate: true`. The adapter should still
+enqueue them using at-least-once semantics: a duplicate on a later run is
+preferable to permanently losing an item whose ID may already be committed.
+
 ## Storage
 
 `tasks.json` uses schema version 2:
@@ -132,7 +152,13 @@ recovery action.
 }
 ```
 
-Mutations use an exclusive lock file and same-directory atomic replacement.
+Mutations build task JSON under a private same-filesystem staging directory and
+use atomic replacement. Lock acquisition writes and syncs a private
+same-directory anchor, then publishes the authoritative lock with a no-replace
+hard link; unsupported filesystems fail closed.
+Lock age and recorded PID never authorize automatic removal. Existing locks
+time out and require operator inspection, avoiding a stale-lock recovery race
+that could delete a new owner's lock.
 Task and state files use user-only permissions where the operating system
 supports them.
 

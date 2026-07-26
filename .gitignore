@@ -1,12 +1,17 @@
 # User data and credentials
-/state*.json
-/*_state.json
-/login*.json
-/*.cookies.json
-/tasks.json
-/tasks.json.lock
-/results.json
-/results_test.json
+/private/
+*state*.json
+*login*.json
+*cookie*.json
+*tasks*.json
+*tasks*.json.lock
+.*state*.json.*.tmp/
+.*login*.json.*.tmp/
+.*cookie*.json.*.tmp/
+.*tasks*.json*.tmp/
+results.json
+results_test.json
+!scripts/state_example.json
 
 # Logs
 *.log

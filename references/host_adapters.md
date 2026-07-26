@@ -66,6 +66,13 @@ The core commits seen IDs before the host delivers stdout. It therefore
 deduplicates collection but cannot promise exactly-once external delivery. For
 durable notifications, make the adapter write successful non-empty stdout to
 an atomic local outbox before forwarding it, and retry the outbox independently.
+Also enqueue retained items from a nonzero result when their task reports
+`persistence.status: recorded`; post-commit cancellation/finalization can expose
+new items that a later run will deduplicate. Surface the failure separately and
+never treat the retained items as proof that the whole batch succeeded.
+If persistence is `not-established` and `possible_duplicate` is true, enqueue
+the candidate items with at-least-once semantics and tolerate a later duplicate;
+the task-file commit may already have suppressed them from future runs.
 After a delivery incident, inspect `last_results`; use `reset-seen` only when
 replaying every current match is intentional.
 
@@ -95,7 +102,7 @@ Do not place browser state in a repository or CI artifact.
 Inject authenticated proxies as `XIANYU_PROXY` or mount a user-private file and
 pass `--proxy-file`; never store proxy credentials in job arguments.
 
-Authenticated monitoring is local by default. A cloud or sandboxed agent can
+Browser-state-backed monitoring is local by default. A cloud or sandboxed agent can
 run it only when the operator securely provisions both the task file and every
 referenced login-state file into that runtime. Never make paths visible by
 committing, uploading, or embedding browser state in a prompt.
@@ -134,7 +141,7 @@ symlinks in these roots.
 Local scheduled tasks load normal local skills. Cloud routines do not receive a
 machine-only `~/.claude/skills` directory; commit the skill into the cloned
 project's `.claude/skills` tree or enable it through the Claude account. Do not
-commit its login state; authenticated cloud execution needs a separate secure
+commit its browser state; state-backed cloud execution needs a separate secure
 secret mount and is otherwise unsupported.
 
 Use the same absolute-path prompt as above, invoking `/xianyu-monitor` when an
