@@ -392,12 +392,52 @@ def test_interrupted_playwright_start_preserves_failed_cleanup_evidence(
 
     monkeypatch.setattr(spider, "async_playwright", Manager)
 
-    with pytest.raises(asyncio.CancelledError) as captured:
+    with pytest.raises(SearchCancelledError) as captured:
         asyncio.run(XianyuSpider()._search_once("test", 1))  # noqa: SLF001
 
     assert captured.value.cleanup_failures == [
         "failed to stop the partially started browser runtime"
     ]
+    assert isinstance(captured.value.__cause__, asyncio.CancelledError)
+
+
+def test_interrupted_start_without_manager_cleanup_preserves_evidence(
+    monkeypatch: Any,
+) -> None:
+    class Manager:
+        async def start(self) -> None:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(spider, "async_playwright", Manager)
+
+    with pytest.raises(SearchCancelledError) as captured:
+        asyncio.run(XianyuSpider()._search_once("test", 1))  # noqa: SLF001
+
+    assert captured.value.cleanup_failures == [
+        "failed to stop the partially started browser runtime"
+    ]
+    assert isinstance(captured.value.__cause__, asyncio.CancelledError)
+
+
+def test_cancelled_manager_cleanup_preserves_evidence_at_task_boundary(
+    monkeypatch: Any,
+) -> None:
+    class Manager:
+        async def start(self) -> None:
+            raise spider.PlaywrightError("simulated start failure")
+
+        async def __aexit__(self, *_args: object) -> None:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(spider, "async_playwright", Manager)
+
+    with pytest.raises(SearchCancelledError) as captured:
+        asyncio.run(XianyuSpider()._search_once("test", 1))  # noqa: SLF001
+
+    assert captured.value.cleanup_failures == [
+        "failed to stop the partially started browser runtime"
+    ]
+    assert isinstance(captured.value.__cause__, asyncio.CancelledError)
 
 
 def test_start_error_with_cleanup_cancellation_is_terminal_and_not_retried(

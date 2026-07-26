@@ -142,6 +142,21 @@ def _append_cleanup_failure(error: BaseException, message: str) -> None:
         failures.append(message)
 
 
+def _cancelled_cleanup_failure(
+    error: asyncio.CancelledError,
+    message: str,
+) -> SearchCancelledError:
+    """Keep cleanup evidence across Python 3.10 Task cancellation boundaries."""
+
+    _append_cleanup_failure(error, message)
+    terminal_error = SearchCancelledError(
+        "search was cancelled; browser cleanup was incomplete",
+        capability_status=search_capability_status(error),
+    )
+    terminal_error.cleanup_failures = list(error.cleanup_failures)
+    return terminal_error
+
+
 def cleanup_evidence(error: BaseException | None = None) -> dict[str, Any]:
     failures = getattr(error, "cleanup_failures", None) if error else None
     if isinstance(failures, list) and failures:
@@ -158,6 +173,8 @@ async def _cleanup_interrupted_playwright_start(
     message = "failed to stop the partially started browser runtime"
     exit_action = getattr(manager, "__aexit__", None)
     if not callable(exit_action):
+        if isinstance(error, asyncio.CancelledError):
+            raise _cancelled_cleanup_failure(error, message) from error
         _append_cleanup_failure(error, message)
         return
     try:
@@ -171,8 +188,17 @@ async def _cleanup_interrupted_playwright_start(
                 "capability_status",
                 search_capability_status(error),
             )
+            if isinstance(cleanup_error, asyncio.CancelledError):
+                raise _cancelled_cleanup_failure(
+                    cleanup_error,
+                    message,
+                ) from cleanup_error
             _append_cleanup_failure(cleanup_error, message)
             raise
+        if isinstance(error, asyncio.CancelledError):
+            # Python 3.10 replaces a CancelledError that escapes a Task, so
+            # attributes attached to that instance do not survive asyncio.run.
+            raise _cancelled_cleanup_failure(error, message) from error
         _append_cleanup_failure(error, message)
 
 

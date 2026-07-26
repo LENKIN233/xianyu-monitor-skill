@@ -17,6 +17,7 @@ from task_manager import (
     TaskMutationPersistenceError,
     TaskMutationProgress,
     _exclusive_lock,
+    _raise_if_async_task_cancelling,
 )
 
 
@@ -1240,3 +1241,38 @@ def test_already_cancelling_task_never_acquires_or_waits_for_lock(
         assert lock_file.read_text(encoding="ascii") == "other owner"
     else:
         assert not lock_file.exists()
+
+
+def test_python_310_pending_cancellation_is_detected_without_cancelling_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Python310Task:
+        _must_cancel = True
+
+    monkeypatch.setattr(
+        task_manager.asyncio,
+        "current_task",
+        lambda: Python310Task(),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        _raise_if_async_task_cancelling()
+
+
+def test_real_task_self_cancellation_is_detected_at_sync_boundary() -> None:
+    events: list[str] = []
+
+    async def cancel_at_boundary() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        try:
+            _raise_if_async_task_cancelling()
+        except asyncio.CancelledError:
+            events.append("caught-at-boundary")
+            raise
+        events.append("missed")
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(cancel_at_boundary())
+    assert events == ["caught-at-boundary"]

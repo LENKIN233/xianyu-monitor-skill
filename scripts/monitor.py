@@ -26,6 +26,7 @@ if __package__:
         TaskMutationInterrupted,
         TaskMutationPersistenceError,
         TaskMutationProgress,
+        _raise_if_async_task_cancelling,
     )
 else:
     from spider import (
@@ -42,6 +43,7 @@ else:
         TaskMutationInterrupted,
         TaskMutationPersistenceError,
         TaskMutationProgress,
+        _raise_if_async_task_cancelling,
     )
 
 
@@ -157,9 +159,7 @@ def _effective_capability_status(
 
 
 def _raise_if_task_cancelling() -> None:
-    task = asyncio.current_task()
-    if task is not None and task.cancelling():
-        raise asyncio.CancelledError
+    _raise_if_async_task_cancelling()
 
 
 @dataclass

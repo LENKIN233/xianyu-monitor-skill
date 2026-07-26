@@ -207,11 +207,21 @@ def _is_control_flow(error: BaseException) -> bool:
 
 
 def _raise_if_async_task_cancelling() -> None:
+    """Raise at sync boundaries when the current task has a pending cancel."""
+
     try:
         task = asyncio.current_task()
     except RuntimeError:
         return
-    if task is not None and task.cancelling():
+    if task is None:
+        return
+    cancelling = getattr(task, "cancelling", None)
+    cancellation_requested = (
+        bool(cancelling())
+        if callable(cancelling)
+        else bool(getattr(task, "_must_cancel", False))
+    )
+    if cancellation_requested:
         raise asyncio.CancelledError
 
 
