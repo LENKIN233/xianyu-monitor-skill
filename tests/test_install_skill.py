@@ -467,7 +467,7 @@ def test_rollback_preserves_concurrently_replaced_target(
 
 
 @pytest.mark.parametrize("mode", ["copy", "symlink"])
-def test_rollback_quarantines_replacement_swapped_after_identity_check(
+def test_rollback_preserves_replacement_swapped_after_identity_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
@@ -515,16 +515,23 @@ def test_rollback_quarantines_replacement_swapped_after_identity_check(
     with pytest.raises(OSError, match="refusing to remove changed"):
         installer._remove_created_target(target, mode, source, ownership)
 
+    assert swapped is True
     quarantined = list(target.parent.glob(".xianyu-monitor.rollback-*/target"))
-    assert len(quarantined) == 1
+    if installer._supports_safe_quarantine_restore():  # noqa: SLF001
+        assert quarantined == []
+        assert list(target.parent.glob(".xianyu-monitor.rollback-*")) == []
+        preserved_replacement = target
+    else:
+        assert len(quarantined) == 1
+        preserved_replacement = quarantined[0]
     if mode == "copy":
-        assert (quarantined[0] / "unrelated.txt").read_text(
+        assert (preserved_replacement / "unrelated.txt").read_text(
             encoding="utf-8"
         ) == "preserve me\n"
         assert (displaced_target / "owned.txt").is_file()
     else:
-        assert quarantined[0].is_symlink()
-        assert quarantined[0].resolve() == replacement_source.resolve()
+        assert preserved_replacement.is_symlink()
+        assert preserved_replacement.resolve() == replacement_source.resolve()
         assert displaced_target.is_symlink()
         assert displaced_target.resolve() == source.resolve()
 
@@ -983,7 +990,7 @@ def test_rollback_preserves_replaced_empty_parent_without_cleanup_failure(
     assert displaced_parent.is_dir()
 
 
-def test_parent_cleanup_quarantines_replacement_swapped_after_identity_check(
+def test_parent_cleanup_preserves_replacement_swapped_after_identity_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1004,13 +1011,23 @@ def test_parent_cleanup_quarantines_replacement_swapped_after_identity_check(
 
     monkeypatch.setattr(Path, "rename", swap_before_rename)
 
-    with pytest.raises(OSError, match="parent changed"):
+    if installer._supports_safe_quarantine_restore():  # noqa: SLF001
         installer._remove_created_parent(ownership)
+    else:
+        with pytest.raises(OSError, match="parent changed"):
+            installer._remove_created_parent(ownership)
 
+    assert swapped is True
     quarantined = list(parent.parent.glob(".skills.rollback-*/parent"))
-    assert len(quarantined) == 1
-    assert quarantined[0].is_dir()
-    assert list(quarantined[0].iterdir()) == []
+    if installer._supports_safe_quarantine_restore():  # noqa: SLF001
+        assert quarantined == []
+        assert list(parent.parent.glob(".skills.rollback-*")) == []
+        assert parent.is_dir()
+        assert list(parent.iterdir()) == []
+    else:
+        assert len(quarantined) == 1
+        assert quarantined[0].is_dir()
+        assert list(quarantined[0].iterdir()) == []
     assert displaced_parent.is_dir()
 
 
