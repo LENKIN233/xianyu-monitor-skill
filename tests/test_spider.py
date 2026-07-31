@@ -44,6 +44,26 @@ from spider import (
 )
 
 
+def _write_cdp_sentinel(profile: Path) -> None:
+    with (profile / CDP_PROFILE_SENTINEL_NAME).open(
+        "w",
+        encoding="utf-8",
+        newline="\n",
+    ) as stream:
+        stream.write(CDP_PROFILE_SENTINEL_VALUE)
+
+
+def test_cdp_sentinel_fixture_uses_platform_independent_lf(tmp_path: Path) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+
+    _write_cdp_sentinel(profile)
+
+    assert (profile / CDP_PROFILE_SENTINEL_NAME).read_bytes() == (
+        CDP_PROFILE_SENTINEL_VALUE.encode("utf-8")
+    )
+
+
 def test_explicit_cdp_ignores_browser_channel_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -141,10 +161,7 @@ def test_windows_temp_alias_rejects_temp_child_reparse(
 def test_cdp_endpoint_requires_private_dedicated_profile(tmp_path: Path) -> None:
     profile = tmp_path / "profile"
     profile.mkdir(mode=0o700)
-    (profile / CDP_PROFILE_SENTINEL_NAME).write_text(
-        CDP_PROFILE_SENTINEL_VALUE,
-        encoding="utf-8",
-    )
+    _write_cdp_sentinel(profile)
     marker = profile / "DevToolsActivePort"
     marker.write_text(
         "54321\n/devtools/browser/synthetic-browser-id\n",
@@ -165,10 +182,7 @@ def test_cdp_endpoint_requires_private_dedicated_profile(tmp_path: Path) -> None
 def test_cdp_endpoint_rejects_invalid_marker(tmp_path: Path) -> None:
     profile = tmp_path / "profile"
     profile.mkdir(mode=0o700)
-    (profile / CDP_PROFILE_SENTINEL_NAME).write_text(
-        CDP_PROFILE_SENTINEL_VALUE,
-        encoding="utf-8",
-    )
+    _write_cdp_sentinel(profile)
     (profile / "DevToolsActivePort").write_text(
         "not-a-port\n/devtools/browser/value\n",
         encoding="utf-8",
@@ -182,10 +196,7 @@ def test_cdp_endpoint_rejects_invalid_marker(tmp_path: Path) -> None:
 def test_cdp_endpoint_rejects_fifo_without_blocking(tmp_path: Path) -> None:
     profile = tmp_path / "profile"
     profile.mkdir(mode=0o700)
-    (profile / CDP_PROFILE_SENTINEL_NAME).write_text(
-        CDP_PROFILE_SENTINEL_VALUE,
-        encoding="utf-8",
-    )
+    _write_cdp_sentinel(profile)
     os.mkfifo(profile / "DevToolsActivePort", mode=0o600)
 
     with pytest.raises(ValueError, match="unable to read DevToolsActivePort"):
@@ -198,10 +209,7 @@ def test_cdp_search_uses_state_in_new_context_and_never_launches(
 ) -> None:
     profile = tmp_path / "profile"
     profile.mkdir(mode=0o700)
-    (profile / CDP_PROFILE_SENTINEL_NAME).write_text(
-        CDP_PROFILE_SENTINEL_VALUE,
-        encoding="utf-8",
-    )
+    _write_cdp_sentinel(profile)
     (profile / "DevToolsActivePort").write_text(
         "54321\n/devtools/browser/synthetic-browser-id\n",
         encoding="utf-8",
@@ -350,10 +358,7 @@ def test_cdp_search_requires_a_state_file(tmp_path: Path) -> None:
 def test_cdp_search_rejects_state_inside_profile(tmp_path: Path) -> None:
     profile = tmp_path / "profile"
     profile.mkdir(mode=0o700)
-    (profile / CDP_PROFILE_SENTINEL_NAME).write_text(
-        CDP_PROFILE_SENTINEL_VALUE,
-        encoding="utf-8",
-    )
+    _write_cdp_sentinel(profile)
 
     with pytest.raises(ValueError, match="outside the CDP profile"):
         XianyuSpider(
