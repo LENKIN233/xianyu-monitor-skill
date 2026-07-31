@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,8 @@ from urllib.parse import urlencode
 import pytest
 import spider
 from spider import (
+    CDP_PROFILE_SENTINEL_NAME,
+    CDP_PROFILE_SENTINEL_VALUE,
     BrowserCleanupError,
     CapturedSearchResponse,
     CaptureTicket,
@@ -23,17 +26,340 @@ from spider import (
     StateFileError,
     StorageStateValidationError,
     XianyuSpider,
+    _cdp_endpoint_from_user_data_dir,
     _context_options,
     _filter_goofish_storage_state,
     _has_storage_state_material,
     _load_state_file,
     _navigate_to_search,
+    _private_cdp_profile_path,
     _redact_proxy,
+    _resolve_browser_channel,
+    _resolve_temporary_cdp_directory,
     _safe_page_location,
     _validate_search_navigation,
+    _windows_local_app_data,
     build_proxy_settings,
     resolve_proxy,
 )
+
+
+def test_explicit_cdp_ignores_browser_channel_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XIANYU_BROWSER_CHANNEL", "chrome")
+
+    args = spider.build_parser().parse_args(
+        [
+            "--keyword",
+            "test",
+            "--state",
+            "/private/state.json",
+            "--cdp-user-data-dir",
+            "/private/profile",
+        ]
+    )
+
+    assert args.browser_channel is None
+    assert _resolve_browser_channel(None, args.cdp_user_data_dir) is None
+    assert _resolve_browser_channel(None, None) == "chrome"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink coverage")
+def test_configured_temp_root_cannot_promote_user_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "chosen-target"
+    profile = target / "profile"
+    profile.mkdir(parents=True, mode=0o700)
+    configured = tmp_path / "configured-temp"
+    configured.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(spider.tempfile, "gettempdir", lambda: str(configured))
+
+    with pytest.raises(ValueError, match="symlinks|temporary directory"):
+        _resolve_temporary_cdp_directory(str(configured / "profile"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Known Folder coverage")
+def test_windows_temp_root_ignores_userprofile_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _windows_local_app_data()
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "forged-profile"))
+    monkeypatch.setenv("HOMEDRIVE", "Z:")
+    monkeypatch.setenv("HOMEPATH", "\\forged-profile")
+
+    assert _windows_local_app_data() == expected
+    roots = {canonical for _, canonical in spider._temporary_cdp_root_aliases()}
+    assert (expected / "Temp").resolve(strict=False) in roots
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink fixture")
+def test_windows_temp_alias_allows_known_folder_redirection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_base = tmp_path / "canonical-local-app-data"
+    (canonical_base / "Temp").mkdir(parents=True)
+    lexical_base = tmp_path / "known-folder-alias"
+    lexical_base.symlink_to(canonical_base, target_is_directory=True)
+    monkeypatch.setattr(
+        spider,
+        "_windows_local_app_data",
+        lambda: lexical_base,
+    )
+
+    assert spider._windows_cdp_temp_root_aliases() == (
+        (lexical_base / "Temp", canonical_base / "Temp"),
+        (canonical_base / "Temp", canonical_base / "Temp"),
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink fixture")
+def test_windows_temp_alias_rejects_temp_child_reparse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_app_data = tmp_path / "local-app-data"
+    local_app_data.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (local_app_data / "Temp").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(
+        spider,
+        "_windows_local_app_data",
+        lambda: local_app_data,
+    )
+
+    with pytest.raises(ValueError, match="must not be a reparse point"):
+        spider._windows_cdp_temp_root_aliases()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission coverage")
+def test_cdp_endpoint_requires_private_dedicated_profile(tmp_path: Path) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir(mode=0o700)
+    (profile / CDP_PROFILE_SENTINEL_NAME).write_text(
+        CDP_PROFILE_SENTINEL_VALUE,
+        encoding="utf-8",
+    )
+    marker = profile / "DevToolsActivePort"
+    marker.write_text(
+        "54321\n/devtools/browser/synthetic-browser-id\n",
+        encoding="utf-8",
+    )
+
+    assert _private_cdp_profile_path(str(profile)) == profile
+    assert _cdp_endpoint_from_user_data_dir(
+        str(profile),
+        timeout_seconds=0,
+    ) == ("ws://127.0.0.1:54321/devtools/browser/synthetic-browser-id")
+
+    profile.chmod(0o755)
+    with pytest.raises(ValueError, match="private"):
+        _private_cdp_profile_path(str(profile))
+
+
+def test_cdp_endpoint_rejects_invalid_marker(tmp_path: Path) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir(mode=0o700)
+    (profile / CDP_PROFILE_SENTINEL_NAME).write_text(
+        CDP_PROFILE_SENTINEL_VALUE,
+        encoding="utf-8",
+    )
+    (profile / "DevToolsActivePort").write_text(
+        "not-a-port\n/devtools/browser/value\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid DevToolsActivePort"):
+        _cdp_endpoint_from_user_data_dir(str(profile), timeout_seconds=0)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO coverage")
+def test_cdp_endpoint_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir(mode=0o700)
+    (profile / CDP_PROFILE_SENTINEL_NAME).write_text(
+        CDP_PROFILE_SENTINEL_VALUE,
+        encoding="utf-8",
+    )
+    os.mkfifo(profile / "DevToolsActivePort", mode=0o600)
+
+    with pytest.raises(ValueError, match="unable to read DevToolsActivePort"):
+        _cdp_endpoint_from_user_data_dir(str(profile), timeout_seconds=0)
+
+
+def test_cdp_search_uses_state_in_new_context_and_never_launches(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir(mode=0o700)
+    (profile / CDP_PROFILE_SENTINEL_NAME).write_text(
+        CDP_PROFILE_SENTINEL_VALUE,
+        encoding="utf-8",
+    )
+    (profile / "DevToolsActivePort").write_text(
+        "54321\n/devtools/browser/synthetic-browser-id\n",
+        encoding="utf-8",
+    )
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "cookie2",
+                        "value": "SYNTHETIC",
+                        "domain": ".goofish.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    events: list[Any] = []
+
+    class Page:
+        url = "https://www.goofish.com/search"
+
+        def set_default_timeout(self, timeout: int) -> None:
+            events.append(("timeout", timeout))
+
+    class Context:
+        async def new_page(self) -> Page:
+            events.append("new-page")
+            return Page()
+
+        async def close(self) -> None:
+            events.append("context-close")
+
+    class Browser:
+        async def new_browser_cdp_session(self) -> Any:
+            class Session:
+                async def send(self, method: str) -> dict[str, Any]:
+                    assert method == "Browser.getBrowserCommandLine"
+                    return {"arguments": [f"--user-data-dir={profile}"]}
+
+                async def detach(self) -> None:
+                    events.append("session-detach")
+
+            return Session()
+
+        async def new_context(self, **kwargs: Any) -> Context:
+            events.append(("new-context", kwargs))
+            return Context()
+
+        async def close(self) -> None:
+            events.append("browser-disconnect")
+
+    class Chromium:
+        async def connect_over_cdp(self, endpoint: str, **kwargs: Any) -> Browser:
+            events.append(("connect", endpoint, kwargs))
+            return Browser()
+
+        async def launch(self, **_kwargs: Any) -> Browser:
+            raise AssertionError("CDP mode must not launch a browser")
+
+    class Playwright:
+        chromium = Chromium()
+
+        async def stop(self) -> None:
+            events.append("playwright-stop")
+
+    class Manager:
+        async def start(self) -> Playwright:
+            return Playwright()
+
+    class Collector:
+        def __init__(self, *_args: Any):
+            pass
+
+        async def install(self, _context: Context) -> None:
+            events.append("collector-installed")
+
+        def arm(self, expected_page: int) -> CaptureTicket:
+            return CaptureTicket(1, expected_page)
+
+        def disarm(self, _ticket: CaptureTicket) -> None:
+            events.append("collector-disarmed")
+
+        async def next(
+            self,
+            _ticket: CaptureTicket,
+            _timeout: int,
+        ) -> CapturedSearchResponse:
+            return CapturedSearchResponse(
+                status=200,
+                payload={"ret": ["SUCCESS::ok"], "data": {"resultList": []}},
+            )
+
+    async def navigate(*_args: Any, **_kwargs: Any) -> None:
+        events.append("navigated")
+
+    monkeypatch.setattr(spider, "async_playwright", lambda: Manager())
+    monkeypatch.setattr(spider, "SearchResponseCollector", Collector)
+    monkeypatch.setattr(spider, "_navigate_to_search", navigate)
+
+    instance = XianyuSpider(
+        state_file=str(state_file),
+        cdp_user_data_dir=str(profile),
+        verbose=False,
+    )
+    assert asyncio.run(instance.search("test", max_retries=1)) == []
+
+    connect_event = next(event for event in events if event[0] == "connect")
+    assert connect_event[1].startswith("ws://127.0.0.1:54321/devtools/browser/")
+    context_event = next(event for event in events if event[0] == "new-context")
+    assert context_event[1]["service_workers"] == "block"
+    assert context_event[1]["storage_state"]["cookies"][0]["name"] == "cookie2"
+    assert events[-3:] == [
+        "context-close",
+        "browser-disconnect",
+        "playwright-stop",
+    ]
+
+
+def test_cdp_command_line_requires_one_absolute_matching_profile(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir(mode=0o700)
+
+    assert spider._command_line_uses_profile([f"--user-data-dir={profile}"], profile)
+    assert not spider._command_line_uses_profile(["--user-data-dir=profile"], profile)
+    assert not spider._command_line_uses_profile(
+        [f"--user-data-dir={profile}", f"--user-data-dir={profile}"],
+        profile,
+    )
+
+
+def test_cdp_search_requires_a_state_file(tmp_path: Path) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir(mode=0o700)
+
+    with pytest.raises(ValueError, match="requires --state"):
+        XianyuSpider(cdp_user_data_dir=str(profile))
+
+
+def test_cdp_search_rejects_state_inside_profile(tmp_path: Path) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir(mode=0o700)
+    (profile / CDP_PROFILE_SENTINEL_NAME).write_text(
+        CDP_PROFILE_SENTINEL_VALUE,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="outside the CDP profile"):
+        XianyuSpider(
+            state_file=str(profile / "state.json"),
+            cdp_user_data_dir=str(profile),
+        )
 
 
 def _function_line(function: Any, marker: str) -> int:

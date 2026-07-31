@@ -98,9 +98,11 @@ python scripts/install_skill.py --host all --mode symlink
 |---|---|---|
 | Codex | `~/.agents/skills/xianyu-monitor` | `$xianyu-monitor` |
 | Claude Code | `~/.claude/skills/xianyu-monitor` | `/xianyu-monitor` |
-| OpenClaw | `~/.agents/skills/xianyu-monitor` | `/skill xianyu-monitor` |
+| OpenClaw | `~/.agents/skills/xianyu-monitor` | `/xianyu-monitor` |
 
-Codex 与新版 OpenClaw 共用 `~/.agents/skills`。不支持目录软链接时，改用
+当前 [Codex](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills)
+与 [OpenClaw](https://docs.openclaw.ai/skills) 官方文档都列出
+`~/.agents/skills`。不支持目录软链接时，改用
 `--mode copy`；复制模式不会带上 `.git`、虚拟环境、测试缓存或本地任务/登录文件，
 也不会覆盖已有路径。一次多宿主安装若中途失败，会回滚本次已创建的 Skill；已有
 symlink 与请求的 copy 模式不一致时会明确失败，不会伪装成复制安装成功。
@@ -122,11 +124,90 @@ python scripts/login_state.py \
   --output "/absolute/private/path/xianyu-state.json"
 ```
 
-命令会在交互终端显示一次性 `SAVE-...` 确认词。Agent 必须暂停并等待用户本人回复
-这个确认词，不得代输、管道注入、猜测或复用。非交互输入、EOF、错误确认词、仍在
-登录/验证/风控页面、未观察到导航响应的展示名字段，或没有保留下来的 Goofish
-浏览器存储材料时，
-都不会保存文件。
+`--browser-channel chrome` 只选择 Chrome 可执行文件，不会复用已经打开的普通 Chrome
+会话或 profile；必须在命令新开的窗口里重新登录。
+
+若 Agent 沙箱无法启动 Chrome，可由用户在普通 Terminal 外部启动一个全新、临时、
+仅用于闲鱼的私有 profile。不要使用日常 Chrome 的默认数据目录：
+
+```bash
+# macOS Terminal
+cdp_profile="$(mktemp -d /private/tmp/xianyu-cdp.XXXXXX)"
+chmod 700 "$cdp_profile"
+python scripts/cdp_profile.py --directory "$cdp_profile"
+open -na "Google Chrome" --args \
+  --user-data-dir="$cdp_profile" \
+  --remote-debugging-port=0 \
+  --enable-automation \
+  --no-first-run \
+  --no-default-browser-check \
+  "https://www.goofish.com/"
+```
+
+随后把这个精确目录传给受限环境中的登录命令：
+
+```bash
+python scripts/login_state.py \
+  --cdp-user-data-dir "/absolute/private/tmp/xianyu-cdp.EXACT" \
+  --confirm-in-browser \
+  --output "/absolute/private/path/xianyu-state.json"
+```
+
+初始化命令只接受操作系统临时目录下的空目录，并在 Chrome 启动前写入专用 profile
+哨兵。登录和搜索命令
+连接前只读取该哨兵与 Chrome 生成的 `DevToolsActivePort`，只连接本机 loopback；已知
+默认 Chrome 目录及用户控制的中间/最终符号链接会被拒绝；只允许 macOS
+`/var` 到 `/private/var` 这类操作系统临时根标准别名。连接后还会通过 CDP 读取
+Chrome 自报的启动参数，
+在 Playwright 建立连接后立即核对精确的 `--user-data-dir`，并且在本 Skill 读取默认
+context 存储或创建搜索 context 前完成；连接传输本身可能枚举 target 元数据，因此该
+profile 路径仍属于敏感授权范围。启动时必须保留 `--enable-automation`。POSIX 下还会
+验证当前用户所有及 `0700` 等价
+的私有权限。Windows 下 CLI 无法验证 NTFS ACL，必须先由用户把该专用目录限制为仅
+本人可访问。外部 Terminal 的 `$cdp_profile` 变量不会自动进入 Agent 沙箱，必须私下
+传递其精确绝对路径；两边还必须共享该文件路径、用户身份和本机 loopback 网络。
+Agent 必须交还浏览器控制，由用户
+本人在闲鱼页登录、核对账号，并在本地确认页输入可见的一次性确认码。Agent 不得读取、
+填写或点击该确认页。状态搜索验证结束后，先关闭这一个专用 Chrome，再只清理它对应的
+精确临时目录：
+
+```bash
+python scripts/cdp_profile.py \
+  --directory "/absolute/private/tmp/xianyu-cdp.EXACT" \
+  --cleanup
+```
+
+清理命令会拒绝未初始化/非临时目录、检测到的 Chrome 活动锁、仍在监听的调试端口，
+以及不支持抗符号链接递归删除的平台。并发启动无法安全支持：必须严格串行执行
+“关闭 Chrome → 清理”，清理期间绝不能用该 profile 重启 Chrome。若平台不支持自动
+清理，由用户在系统文件管理器中只把该精确目录移入废纸篓/回收站。不要用宽泛的递归
+删除命令代替。
+
+上述启动片段适用于 macOS。Windows PowerShell 使用系统 Known Folder API 返回的
+`LocalApplicationData` 下的 `Temp` 目录，并用当前用户 NTFS ACL 限制访问，再初始化
+并启动 Chrome（Chrome 路径按实际安装位置调整）：
+
+```powershell
+$localAppData = [Environment]::GetFolderPath(
+  [Environment+SpecialFolder]::LocalApplicationData
+)
+$tempRoot = Join-Path $localAppData "Temp"
+$cdpProfile = Join-Path $tempRoot ("xianyu-cdp." + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $cdpProfile | Out-Null
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+icacls $cdpProfile /inheritance:r /grant:r "${currentUser}:(OI)(CI)F" | Out-Null
+python scripts/cdp_profile.py --directory $cdpProfile
+& "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" `
+  "--user-data-dir=$cdpProfile" --remote-debugging-port=0 `
+  --enable-automation --no-first-run --no-default-browser-check `
+  "https://www.goofish.com/"
+```
+
+默认模式会在交互终端显示一次性 `SAVE-...` 确认词。Agent 必须暂停并等待用户本人
+输入，不得代输、管道注入、猜测或复用；此模式下非交互输入、EOF 或错误确认词都会
+失败。`--confirm-in-browser` 把同样的明确确认移到上述本地确认页，是唯一允许命令使用
+非交互输入的模式。仍在登录/验证/风控页面、未观察到导航响应的展示名字段，或没有
+保留下来的 Goofish 浏览器存储材料时，两种模式都不会保存文件。
 
 确认后，命令会新开一个验证页，检查当前 PC 导航响应是否含非空展示名。闲鱼当前布局
 把它当作候选会话信号，但这是未公开承诺的候选信号，不是身份凭据。命令只在内存中判断
@@ -139,9 +220,10 @@ POSIX 下文件权限为 `0600`；除非明确增加 `--force`，否则不会覆
 - `state.status: not-saved`：已确定本次没有发布状态文件；
 - `state.status: not-established`：中断或系统错误使原子发布结果无法确认；此路径必须
   继续按异常凭据保密，不得读取、使用，也不得声称文件已保存或不存在；
-- `confirmation.status: interactive-token-received`：终端收到了确认词，但程序本身
-  无法判断输入者是用户还是 Agent；
+- `confirmation.status: interactive-token-received`：终端或本地确认页收到了确认词，
+  但程序本身无法判断输入者是用户还是 Agent；
 - `confirmation.actor: not-machine-verified`：程序不能验证是谁输入了确认词；
+- `confirmation.channel`：`terminal` 或 `browser`；两者都不能证明实际确认者身份；
 - `session.nav_display_name: present`：当前 Goofish PC 导航响应含非空展示名，
   但它不能证明具体账号身份；
 - `authentication.status: not-established`：程序没有证明该候选状态已认证；
@@ -196,13 +278,17 @@ python scripts/spider.py \
   --state /absolute/private/path/xianyu-state.json
 ```
 
+若同一沙箱也无法启动搜索浏览器，可保持上述专用 Chrome 开启，并给搜索命令追加
+`--cdp-user-data-dir "/absolute/private/tmp/xianyu-cdp.EXACT"`。CDP 搜索仍强制要求显式 `--state`，不会把连接的
+profile 当成隐式授权或直接凭据来源。
+
 成功输出：
 
 ```json
 {
   "ok": true,
   "keyword": "iPhone 15 Pro",
-  "count": 2,
+  "count": 0,
   "pages_scraped": 2,
   "items": [],
   "search_capability": {"status": "passed-for-this-run"},
@@ -211,6 +297,10 @@ python scripts/spider.py \
   "cleanup": {"status": "complete-or-not-required"}
 }
 ```
+
+一页一次 smoke test 还必须满足退出码为 `0`、`count == len(items)`、
+`pages_scraped: 1`、搜索能力通过且清理完成；`authentication` 与 `identity` 仍只是
+`not-evaluated`，不能据此声称机器已验证登录或账号身份。
 
 观察到登录跳转或挑战、风控或网络失败会输出 `"ok": false` 并返回非零退出码。闲鱼返回
 `RGV587` 等风控错误时立即停止；不要尝试绕过登录挑战、CAPTCHA 或风控。
@@ -311,14 +401,18 @@ pytest
 smoke test，必须由用户本人在本机可见浏览器中登录并输入一次性确认词；不要把凭据
 加入测试夹具或 CI。
 
+离线测试同时覆盖非 TTY fail-closed、浏览器确认、专用 CDP profile 校验和 CDP
+搜索连接；这些用例只使用合成状态，不读取真实 profile 或网络。
+
 ## 安全说明
 
 - 登录状态相当于账号凭证，不要上传、截图或发给他人。
 - 状态与任务文件应放在 checkout 之外；确需放入仓库目录时，只使用已整体忽略的
   根目录 `private/`，不要依赖自定义文件名恰好被忽略。
-- 登录命令只在 stdout 输出一个最终 JSON；`browser-opening` 进度写入 stderr。
-- 登录命令的输出会包含私有状态文件路径；stdout/stderr 日志只保留在本机，不要上传
-  到 CI、工单或公共聊天。
+- 登录命令只在 stdout 输出一个最终 JSON；`browser-opening` 和可选的
+  `browser-confirmation-ready` 进度写入 stderr。
+- 登录命令不会在 JSON 或进度中回显私有状态/CDP profile 路径；即便如此，也不要把
+  本地登录日志上传到 CI、工单或公共聊天。
 - 建议监控间隔不少于 30 分钟。
 - 遇到 `SearchCaptureError` 不会自动重试；候选状态已进入搜索页时最多手动执行
   一次 `--headed`。

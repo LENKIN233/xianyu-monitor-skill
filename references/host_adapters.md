@@ -9,7 +9,7 @@ same Agent Skills directory and one-shot monitor command to common hosts.
 |---|---|---|
 | Codex | `~/.agents/skills/xianyu-monitor` | `$xianyu-monitor` |
 | Claude Code | `~/.claude/skills/xianyu-monitor` | `/xianyu-monitor` |
-| OpenClaw | `~/.agents/skills/xianyu-monitor` | `/skill xianyu-monitor` |
+| OpenClaw | `~/.agents/skills/xianyu-monitor` | `/xianyu-monitor` |
 | Plain CLI | Any directory | Run `scripts/*.py` |
 
 Codex and OpenClaw share the current `~/.agents/skills` convention. OpenClaw
@@ -104,8 +104,37 @@ pass `--proxy-file`; never store proxy credentials in job arguments.
 
 Browser-state-backed monitoring is local by default. A cloud or sandboxed agent can
 run it only when the operator securely provisions both the task file and every
-referenced login-state file into that runtime. Never make paths visible by
-committing, uploading, or embedding browser state in a prompt.
+referenced login-state file into that runtime. Never expose browser-state
+contents by committing, uploading, or embedding them in a prompt. An exact
+local path may appear only in the operator-authorized host configuration needed
+to run the command; do not publish it.
+
+If a local sandbox can read the approved state but cannot launch Chromium, use
+the CDP fallback only with an exact operator-approved, temporary, private Chrome
+user-data directory under an operating-system temporary root, created outside
+the sandbox. Start Chrome with a non-default
+`--user-data-dir`, `--remote-debugging-port=0`, and `--enable-automation`.
+Before Chrome starts, initialize the empty directory with
+`scripts/cdp_profile.py --directory PATH`; pass that directory through
+`--cdp-user-data-dir`. Never point it at the operator's daily/default profile.
+The login flow may use `--confirm-in-browser`; the agent must release browser
+control while the operator types the visible confirmation code. CDP search still
+requires the exact authorized `--state` path and creates a separate search
+context. The operator must privately hand over the exact absolute directory;
+shell variables do not cross into the sandbox. This bridge is available only
+when the host and sandbox share the directory, user identity, and loopback
+namespace. POSIX permissions are checked by the CLI. On Windows, use the
+`Temp` child of the LocalAppData Known Folder and restrict the directory with
+the current user's NTFS ACL before use because the CLI cannot verify that ACL.
+Close the dedicated Chrome and remove only that exact temporary profile after
+the run.
+Use `scripts/cdp_profile.py --directory PATH --cleanup` only after the operator
+closes that dedicated Chrome. The guarded cleanup refuses a non-temporary or
+uninitialized directory, Chrome activity indicators, and a listening debugging
+endpoint. Keep close and cleanup strictly serial; never relaunch that profile
+concurrently. On a platform without symlink-safe recursive removal, cleanup
+fails closed and the operator must move only that exact directory through the
+operating-system file manager. Do not replace it with a broad recursive delete.
 
 ## Codex
 
@@ -172,6 +201,10 @@ OpenClaw releases. Verify discovery with:
 ```bash
 openclaw skills list
 ```
+
+Also run `openclaw cron --help` on the target host before creating a job; the
+examples below follow the current CLI, but a different installed release may
+expose a different command surface.
 
 For deterministic collection without a model turn, create a command job. Fill
 in an explicit delivery target when needed:

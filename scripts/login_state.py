@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import os
 import secrets
@@ -36,8 +37,12 @@ if __package__:
     from .spider import (
         BASE_URL,
         DependencyError,
+        _cdp_endpoint_from_user_data_dir,
+        _command_line_uses_profile,
         _filter_goofish_storage_state,
         _has_storage_state_material,
+        _private_cdp_profile_path,
+        _resolve_browser_channel,
         _safe_page_location,
     )
 else:
@@ -45,8 +50,12 @@ else:
     from spider import (
         BASE_URL,
         DependencyError,
+        _cdp_endpoint_from_user_data_dir,
+        _command_line_uses_profile,
         _filter_goofish_storage_state,
         _has_storage_state_material,
+        _private_cdp_profile_path,
+        _resolve_browser_channel,
         _safe_page_location,
     )
 
@@ -64,6 +73,7 @@ BLOCKED_PAGE_MARKERS = ("captcha", "challenge", "login", "passport", "punish", "
 @dataclass
 class CaptureProgress:
     confirmation_received: bool = False
+    confirmation_channel: str = "terminal"
     nav_display_name_present: bool = False
     state_saved: bool = False
     state_commit_status: str = "not-saved"
@@ -304,6 +314,151 @@ def _read_explicit_confirmation(
         raise ValueError("confirmation did not match; browser state was not saved")
 
 
+def _browser_confirmation_document(token: str, binding_name: str) -> str:
+    visible_token = html.escape(token)
+    binding_literal = json.dumps(binding_name).replace("<", "\\u003c")
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'unsafe-inline';
+                 script-src 'unsafe-inline'; form-action 'none'; connect-src 'none'">
+  <title>闲鱼登录状态确认</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+           margin: 0; background: #f6f7f9; color: #1f2328; }}
+    main {{ max-width: 680px; margin: 8vh auto; padding: 32px;
+            background: white; border-radius: 18px;
+            box-shadow: 0 12px 36px rgba(0,0,0,.09); }}
+    h1 {{ margin-top: 0; }}
+    code {{ display: inline-block; padding: 8px 12px; border-radius: 8px;
+            background: #f0f2f4; font-size: 20px; letter-spacing: .08em; }}
+    input, button {{ box-sizing: border-box; width: 100%; margin-top: 14px;
+                     padding: 12px 14px; font: inherit; border-radius: 10px; }}
+    input {{ border: 1px solid #aeb6bf; }}
+    button {{ border: 0; background: #ffda44; color: #171717; font-weight: 700;
+              cursor: pointer; }}
+    .note {{ color: #57606a; line-height: 1.6; }}
+    #error {{ color: #b42318; }}
+    #confirmed {{ color: #16794b; font-weight: 700; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>确认保存闲鱼候选登录状态</h1>
+    <p class="note">先切换到闲鱼标签页。由你本人完成登录、
+      验证码或 CAPTCHA，打开账号区域核对预期账号。回到本页输入
+      下方确认码。</p>
+    <p><code>{visible_token}</code></p>
+    <form id="confirmation-form">
+      <label for="confirmation-input">确认码</label>
+      <input id="confirmation-input" autocomplete="off" spellcheck="false">
+      <button type="submit">确认保存候选状态</button>
+    </form>
+    <p id="error" hidden>确认码不匹配，请重新核对。</p>
+    <p id="confirmed" hidden>已收到确认，请等待本地状态验证完成。</p>
+  </main>
+  <script>
+    const bindingName = {binding_literal};
+    const form = document.getElementById('confirmation-form');
+    const input = document.getElementById('confirmation-input');
+    const error = document.getElementById('error');
+    const confirmed = document.getElementById('confirmed');
+    form.addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      let accepted = false;
+      try {{
+        accepted = await window[bindingName](input.value.trim());
+      }} catch (_error) {{
+        accepted = false;
+      }}
+      if (!accepted) {{
+        error.hidden = false;
+        return;
+      }}
+      error.hidden = true;
+      confirmed.hidden = false;
+      input.disabled = true;
+      form.querySelector('button').disabled = true;
+    }});
+  </script>
+</body>
+</html>"""
+
+
+def _read_browser_confirmation(
+    context: Any,
+    error_stream: TextIO,
+    token: str,
+    timeout_seconds: float,
+    progress: CaptureProgress,
+) -> None:
+    """Wait for an explicit token typed by the user in a local-only page."""
+
+    if timeout_seconds <= 0:
+        raise TimeoutError("timed out before browser confirmation")
+    confirmation_page = context.new_page()
+    accepted = False
+    binding_name = f"__xianyuConfirm{secrets.token_hex(8)}"
+
+    def receive_confirmation(source: dict[str, Any], submitted: Any) -> bool:
+        nonlocal accepted
+        if accepted or not isinstance(submitted, str):
+            return False
+        if source.get("page") is not confirmation_page:
+            return False
+        if source.get("frame") is not confirmation_page.main_frame:
+            return False
+        if confirmation_page.url != "about:blank":
+            return False
+        if not secrets.compare_digest(submitted.strip(), token):
+            return False
+        accepted = True
+        return True
+
+    try:
+        confirmation_page.expose_binding(binding_name, receive_confirmation)
+        confirmation_page.set_content(
+            _browser_confirmation_document(token, binding_name),
+            wait_until="domcontentloaded",
+        )
+        confirmation_page.bring_to_front()
+        print(
+            json.dumps(
+                {
+                    "status": "browser-confirmation-ready",
+                    "requires_user_confirmation": True,
+                    "confirmation_channel": "browser",
+                },
+                ensure_ascii=True,
+            ),
+            file=error_stream,
+            flush=True,
+        )
+        deadline = time.monotonic() + timeout_seconds
+        while not accepted:
+            if confirmation_page.is_closed():
+                raise ValueError("browser confirmation page closed before confirmation")
+            if confirmation_page.url != "about:blank":
+                raise ValueError("browser confirmation page navigated unexpectedly")
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                raise TimeoutError("timed out waiting for in-browser confirmation")
+            try:
+                confirmation_page.wait_for_timeout(min(remaining_ms, 250))
+            except PlaywrightError as exc:
+                raise ValueError("browser confirmation did not complete") from exc
+        progress.confirmation_received = True
+        progress.confirmation_channel = "browser"
+    finally:
+        _cleanup_preserving_primary_error(
+            confirmation_page.close,
+            "failed to close the browser confirmation page",
+            progress,
+        )
+
+
 def _validate_confirmation_page(url: str) -> None:
     """Reject login and challenge pages without treating a URL as identity proof."""
 
@@ -442,12 +597,51 @@ def _cleanup_interrupted_playwright_start(
             raise
 
 
+def _verify_sync_cdp_profile(browser: Any, expected_profile: Path) -> None:
+    """Fail closed unless Chrome proves which user-data directory it uses."""
+
+    session: Any | None = None
+    try:
+        session = browser.new_browser_cdp_session()
+        payload = session.send("Browser.getBrowserCommandLine")
+    except (AttributeError, PlaywrightError) as exc:
+        raise ValueError(
+            "connected Chrome could not prove its dedicated user-data directory; "
+            "restart it with --enable-automation"
+        ) from exc
+    finally:
+        if session is not None:
+            try:
+                session.detach()
+            except PlaywrightError:
+                pass
+    arguments = payload.get("arguments") if isinstance(payload, dict) else None
+    if not _command_line_uses_profile(arguments, expected_profile):
+        raise ValueError(
+            "connected Chrome did not use the approved dedicated user-data directory"
+        )
+
+
+def _credential_output_outside_profile(
+    output_file: str,
+    cdp_profile: Path | None,
+) -> Path:
+    output = _credential_output_path(output_file)
+    if cdp_profile is not None and (
+        output == cdp_profile or output.is_relative_to(cdp_profile)
+    ):
+        raise ValueError("login-state output must be outside the CDP profile")
+    return output
+
+
 def capture_login_state(
     output_file: str,
     *,
     browser_channel: str | None,
     timeout_seconds: int,
     force: bool,
+    cdp_user_data_dir: str | None = None,
+    confirm_in_browser: bool = False,
     input_stream: TextIO | None = None,
     error_stream: TextIO | None = None,
     token_factory: Callable[[], str] = _new_confirmation_token,
@@ -463,19 +657,32 @@ def capture_login_state(
     confirmation_input = input_stream if input_stream is not None else sys.stdin
     confirmation_errors = error_stream if error_stream is not None else sys.stderr
     capture_progress = progress if progress is not None else CaptureProgress()
-    if not _is_interactive_stream(confirmation_input):
+    if browser_channel and cdp_user_data_dir:
+        raise ValueError(
+            "--browser-channel and --cdp-user-data-dir are mutually exclusive"
+        )
+    if not confirm_in_browser and not _is_interactive_stream(confirmation_input):
         raise ValueError(
             "interactive terminal required; the user must confirm personally"
         )
-    output = _credential_output_path(output_file)
+    cdp_profile = (
+        _private_cdp_profile_path(cdp_user_data_dir) if cdp_user_data_dir else None
+    )
+    output = _credential_output_outside_profile(output_file, cdp_profile)
     if output.is_symlink():
         raise ValueError(f"refusing to write login state through a symlink: {output}")
     if output.exists() and not force:
         raise FileExistsError(f"{output} already exists; pass --force to replace it")
+    cdp_endpoint = (
+        _cdp_endpoint_from_user_data_dir(str(cdp_profile))
+        if cdp_profile is not None
+        else None
+    )
 
     playwright_manager = sync_playwright()
     playwright: Any | None = None
     browser: Any | None = None
+    connected_page: Any | None = None
     try:
         try:
             playwright = playwright_manager.start()
@@ -489,18 +696,40 @@ def capture_login_state(
             )
             raise
 
-        launch_kwargs: dict[str, Any] = {"headless": False}
-        if browser_channel:
-            launch_kwargs["channel"] = browser_channel
-        browser = playwright.chromium.launch(**launch_kwargs)
+        if cdp_endpoint:
+            try:
+                browser = playwright.chromium.connect_over_cdp(
+                    cdp_endpoint,
+                    timeout=min(max(timeout_seconds * 1000, 1), 60_000),
+                )
+            except PlaywrightError as exc:
+                raise ValueError(
+                    "unable to connect to the dedicated local Chrome browser"
+                ) from exc
+            _verify_sync_cdp_profile(browser, cdp_profile)
+        else:
+            launch_kwargs: dict[str, Any] = {"headless": False}
+            if browser_channel:
+                launch_kwargs["channel"] = browser_channel
+            browser = playwright.chromium.launch(**launch_kwargs)
 
         if browser is not None:
-            context = browser.new_context(
-                locale="zh-CN",
-                timezone_id="Asia/Shanghai",
-                viewport={"width": 1440, "height": 900},
-            )
+            if cdp_endpoint:
+                contexts = list(browser.contexts)
+                if len(contexts) != 1:
+                    raise ValueError(
+                        "dedicated CDP Chrome must expose exactly one browser context"
+                    )
+                context = contexts[0]
+            else:
+                context = browser.new_context(
+                    locale="zh-CN",
+                    timezone_id="Asia/Shanghai",
+                    viewport={"width": 1440, "height": 900},
+                )
             page = context.new_page()
+            if cdp_endpoint:
+                connected_page = page
             try:
                 page.goto(
                     BASE_URL,
@@ -511,20 +740,31 @@ def capture_login_state(
                 raise TimeoutError("timed out opening Xianyu login page") from exc
 
             deadline = time.monotonic() + timeout_seconds
-            try:
-                _read_explicit_confirmation(
-                    confirmation_input,
+            token = token_factory()
+            if confirm_in_browser:
+                _read_browser_confirmation(
+                    context,
                     confirmation_errors,
-                    token_factory(),
+                    token,
                     deadline - time.monotonic(),
-                    browser_closed=page.is_closed,
+                    capture_progress,
                 )
-            except BaseException as exc:  # noqa: BLE001
-                for failure in getattr(exc, "cleanup_failures", []):
-                    if failure not in capture_progress.cleanup_failures:
-                        capture_progress.cleanup_failures.append(failure)
-                raise
-            capture_progress.confirmation_received = True
+            else:
+                try:
+                    _read_explicit_confirmation(
+                        confirmation_input,
+                        confirmation_errors,
+                        token,
+                        deadline - time.monotonic(),
+                        browser_closed=page.is_closed,
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    for failure in getattr(exc, "cleanup_failures", []):
+                        if failure not in capture_progress.cleanup_failures:
+                            capture_progress.cleanup_failures.append(failure)
+                    raise
+                capture_progress.confirmation_received = True
+                capture_progress.confirmation_channel = "terminal"
             _validate_confirmation_page(page.url)
             # Attach only after explicit confirmation so the identity-bearing
             # response is not read before consent and cannot be a stale signal
@@ -564,9 +804,15 @@ def capture_login_state(
                 capture_progress.state_saved = True
                 capture_progress.state_commit_status = "candidate-saved"
 
+            current_output = _credential_output_outside_profile(
+                str(output),
+                cdp_profile,
+            )
+            if current_output != output:
+                raise ValueError("login-state output directory changed during capture")
             try:
                 saved_output = _secure_write_json(
-                    str(output),
+                    str(current_output),
                     state,
                     force,
                     on_commit=mark_committed_state,
@@ -595,27 +841,37 @@ def capture_login_state(
             return saved_output
     finally:
         try:
-            if browser is not None:
+            if connected_page is not None:
                 _cleanup_preserving_primary_error(
-                    browser.close,
-                    "failed to close the dedicated browser",
+                    connected_page.close,
+                    "failed to close the connected Xianyu page",
                     capture_progress,
                 )
         finally:
-            if playwright is not None:
-                _cleanup_preserving_primary_error(
-                    playwright.stop,
-                    "failed to stop the dedicated browser runtime",
-                    capture_progress,
-                )
+            try:
+                if browser is not None:
+                    _cleanup_preserving_primary_error(
+                        browser.close,
+                        (
+                            "failed to disconnect from the connected browser"
+                            if cdp_endpoint
+                            else "failed to close the dedicated browser"
+                        ),
+                        capture_progress,
+                    )
+            finally:
+                if playwright is not None:
+                    _cleanup_preserving_primary_error(
+                        playwright.stop,
+                        "failed to stop the dedicated browser runtime",
+                        capture_progress,
+                    )
 
 
 def _capture_evidence(progress: CaptureProgress) -> dict[str, Any]:
     state: dict[str, Any]
     if progress.state_saved:
         state = {"status": "candidate-saved"}
-        if progress.saved_output is not None:
-            state["output"] = str(progress.saved_output)
     elif progress.state_commit_status == "not-established":
         state = {"status": "not-established"}
     else:
@@ -630,6 +886,11 @@ def _capture_evidence(progress: CaptureProgress) -> dict[str, Any]:
             ),
             "actor": (
                 "not-machine-verified"
+                if progress.confirmation_received
+                else "not-established"
+            ),
+            "channel": (
+                progress.confirmation_channel
                 if progress.confirmation_received
                 else "not-established"
             ),
@@ -676,23 +937,98 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--output", "-o", required=True)
-    parser.add_argument(
+    browser_group = parser.add_mutually_exclusive_group()
+    browser_group.add_argument(
         "--browser-channel",
-        default=os.getenv("XIANYU_BROWSER_CHANNEL"),
-        help="Playwright browser channel, for example chrome",
+        help=(
+            "Playwright browser executable channel, for example chrome; "
+            "opens a separate context and never reuses an existing Chrome profile"
+        ),
+    )
+    browser_group.add_argument(
+        "--cdp-user-data-dir",
+        help=(
+            "connect through DevToolsActivePort in an explicitly dedicated, "
+            "private Chrome user-data directory"
+        ),
     )
     parser.add_argument(
         "--timeout", type=int, default=600, help="login timeout seconds"
+    )
+    parser.add_argument(
+        "--confirm-in-browser",
+        action="store_true",
+        help=(
+            "show a local-only confirmation page so a user can confirm without "
+            "typing into the command terminal"
+        ),
     )
     parser.add_argument("--force", action="store_true")
     return parser
 
 
+def _terminal_handoff_argv_template(args: argparse.Namespace) -> list[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--output",
+        "<PRIVATE_STATE_PATH>",
+        "--timeout",
+        str(args.timeout),
+    ]
+    if args.browser_channel:
+        command.extend(["--browser-channel", args.browser_channel])
+    if args.cdp_user_data_dir:
+        command.extend(["--cdp-user-data-dir", "<DEDICATED_CDP_PROFILE_PATH>"])
+    if args.force:
+        command.append("--force")
+    return command
+
+
+def _redact_private_paths(message: str, args: argparse.Namespace) -> str:
+    candidates: set[str] = set()
+    for value in (args.output, args.cdp_user_data_dir):
+        if not value:
+            continue
+        requested = Path(value).expanduser()
+        candidates.add(str(requested))
+        candidates.add(str(requested.absolute()))
+        try:
+            candidates.add(str(requested.resolve(strict=False)))
+        except OSError:
+            pass
+    for candidate in sorted(candidates, key=len, reverse=True):
+        if len(candidate) > 1:
+            message = message.replace(candidate, "<private-path>")
+    return message
+
+
+def _safe_capture_error_message(exc: Exception, args: argparse.Namespace) -> str:
+    if isinstance(exc, DependencyError):
+        return str(exc)
+    if isinstance(exc, FileExistsError):
+        return "login-state output already exists; pass --force to replace it"
+    if isinstance(exc, TimeoutError):
+        return _redact_private_paths(str(exc), args)
+    if isinstance(exc, OSError):
+        return "local browser-state file operation failed"
+    if isinstance(exc, PlaywrightError) and not isinstance(
+        exc,
+        BrowserCleanupError,
+    ):
+        return "local browser operation failed"
+    return _redact_private_paths(str(exc), args)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.browser_channel = _resolve_browser_channel(
+        args.browser_channel,
+        args.cdp_user_data_dir,
+    )
     progress = CaptureProgress()
     try:
-        if not _is_interactive_stream(sys.stdin):
+        if not args.confirm_in_browser and not _is_interactive_stream(sys.stdin):
             print(
                 json.dumps(
                     {
@@ -701,6 +1037,11 @@ def main(argv: list[str] | None = None) -> int:
                             "interactive terminal required; "
                             "the user must confirm personally"
                         ),
+                        "handoff": {
+                            "required": True,
+                            "environment": "normal-user-terminal",
+                            "argv_template": _terminal_handoff_argv_template(args),
+                        },
                         **_capture_evidence(progress),
                     },
                     ensure_ascii=True,
@@ -712,8 +1053,15 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "status": "browser-opening",
                     "site": "goofish.com",
-                    "output": str(Path(args.output).expanduser()),
                     "requires_user_confirmation": True,
+                    "confirmation_channel": (
+                        "browser" if args.confirm_in_browser else "terminal"
+                    ),
+                    "browser_mode": (
+                        "connected-dedicated-profile"
+                        if args.cdp_user_data_dir
+                        else "launched-dedicated-context"
+                    ),
                 },
                 ensure_ascii=True,
             ),
@@ -725,6 +1073,8 @@ def main(argv: list[str] | None = None) -> int:
             browser_channel=args.browser_channel,
             timeout_seconds=args.timeout,
             force=args.force,
+            cdp_user_data_dir=args.cdp_user_data_dir,
+            confirm_in_browser=args.confirm_in_browser,
             progress=progress,
         )
         _require_complete_capture(progress)
@@ -763,7 +1113,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "ok": False,
-                    "error": str(exc),
+                    "error": _safe_capture_error_message(exc, args),
                     **_capture_evidence(progress),
                 },
                 ensure_ascii=True,

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +15,7 @@ if __package__:
         SearchCancelledError,
         SpiderError,
         XianyuSpider,
+        _resolve_browser_channel,
         cleanup_evidence,
         resolve_proxy,
         search_capability_status,
@@ -33,6 +33,7 @@ else:
         SearchCancelledError,
         SpiderError,
         XianyuSpider,
+        _resolve_browser_channel,
         cleanup_evidence,
         resolve_proxy,
         search_capability_status,
@@ -266,6 +267,11 @@ async def run_tasks(
             )
         prepared_tasks.append((task, state_file))
 
+    cdp_user_data_dir = getattr(args, "cdp_user_data_dir", None)
+    browser_channel = _resolve_browser_channel(
+        getattr(args, "browser_channel", None),
+        cdp_user_data_dir,
+    )
     reports = run_progress.reports
     had_error = False
     for task, state_file in prepared_tasks:
@@ -295,7 +301,8 @@ async def run_tasks(
                 state_file=state_file,
                 proxy=proxy,
                 headless=not args.headed,
-                browser_channel=args.browser_channel,
+                browser_channel=browser_channel,
+                cdp_user_data_dir=cdp_user_data_dir,
                 verbose=not getattr(args, "quiet_if_empty", False),
             )
             items = await spider.search(
@@ -599,8 +606,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--proxy-file",
         help="read proxy URL from a user-private UTF-8 file",
     )
-    parser.add_argument(
-        "--browser-channel", default=os.getenv("XIANYU_BROWSER_CHANNEL")
+    browser_group = parser.add_mutually_exclusive_group()
+    browser_group.add_argument(
+        "--browser-channel",
+        help="Playwright browser executable channel; does not reuse a profile",
+    )
+    browser_group.add_argument(
+        "--cdp-user-data-dir",
+        help=(
+            "connect through a dedicated private Chrome profile; every selected "
+            "task must resolve an authorized state file"
+        ),
     )
     parser.add_argument("--headed", action="store_true")
     output_group = parser.add_mutually_exclusive_group()

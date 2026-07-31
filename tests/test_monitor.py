@@ -52,6 +52,19 @@ def test_monitor_persists_seen_items(tmp_path: Path, monkeypatch: Any) -> None:
     assert first[0]["identity"]["status"] == "not-evaluated"
 
 
+def test_monitor_parser_leaves_environment_channel_for_cdp_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XIANYU_BROWSER_CHANNEL", "chrome")
+
+    args = monitor.build_parser().parse_args(
+        ["--cdp-user-data-dir", "/private/profile"]
+    )
+
+    assert args.browser_channel is None
+    assert args.cdp_user_data_dir == "/private/profile"
+
+
 def test_monitor_baseline_suppresses_existing_items(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

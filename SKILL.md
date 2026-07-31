@@ -1,6 +1,6 @@
 ---
 name: xianyu-monitor
-description: Search and monitor Xianyu listings with private browser state, filters, pagination, persistent tasks, and deduplication. Use when asked to find or track listings.
+description: Search and monitor Xianyu listings with private browser state, filters, pagination, persistent tasks, and deduplication. Use to find or track listings.
 ---
 
 # Xianyu Monitor
@@ -27,6 +27,9 @@ be used only to resolve that absolute path.
   the exact task-file path and every exact login-state path the job will read.
   Scope that authorization to Xianyu search and monitoring only.
 - Never print, summarize, transmit, or commit cookies or proxy credentials.
+- Treat a CDP user-data directory as credential-bearing browser access. Use it
+  only after the user authorizes that exact path, and only for a dedicated,
+  private, temporary profile. Never attach to a daily/default browser profile.
 - Prefer `--cookie-stdin` over command-line cookie values.
 - Prefer a user-private `--proxy-file` or scheduler-injected `XIANYU_PROXY` over
   credentialed `--proxy` arguments.
@@ -78,13 +81,86 @@ python scripts/login_state.py \
   --output /absolute/private/path/xianyu-state.json
 ```
 
-The command displays a one-time `SAVE-...` confirmation in the interactive
-terminal. When it appears, the agent must pause and wait for the user to provide
-that exact confirmation; the agent must never type, pipe, infer, or reuse it for
-the user. Non-interactive input, EOF, a wrong token, a login/challenge page, a
-missing navigation display-name field, or no retained Goofish browser-storage
-material all fail without
-saving.
+`--browser-channel chrome` selects the Chrome executable; it does not reuse an
+already-open Chrome session or profile. The user must log in inside the new
+window opened by this command.
+
+If a sandbox cannot launch Chrome, have the user start Chrome outside the
+sandbox with a newly created `0700` user-data directory and
+`--remote-debugging-port=0`. Then connect only to that exact directory:
+
+```bash
+# macOS, in the user's normal Terminal
+cdp_profile="$(mktemp -d /private/tmp/xianyu-cdp.XXXXXX)"
+chmod 700 "$cdp_profile"
+python scripts/cdp_profile.py --directory "$cdp_profile"
+open -na "Google Chrome" --args \
+  --user-data-dir="$cdp_profile" \
+  --remote-debugging-port=0 \
+  --enable-automation \
+  --no-first-run \
+  --no-default-browser-check \
+  "https://www.goofish.com/"
+```
+
+The exact absolute path printed or chosen in that terminal must be passed
+privately into the sandbox; a shell variable does not cross process or sandbox
+boundaries. The fallback works only when both environments share that path,
+the same user identity, and the host loopback namespace. Then run:
+
+```bash
+python scripts/login_state.py \
+  --cdp-user-data-dir /private/tmp/xianyu-cdp.EXACT \
+  --confirm-in-browser \
+  --output /absolute/private/path/xianyu-state.json
+```
+
+The initializer accepts only an empty directory under an operating-system
+temporary root and adds the required dedicated profile sentinel before Chrome
+starts. The login/search commands read only that
+sentinel and `DevToolsActivePort` before connecting over loopback. They reject
+known default Chrome locations and user-controlled symlink components. A
+standard operating-system temp-root alias such as macOS `/var` to
+`/private/var` is accepted. They then ask Chrome over CDP for its launch command
+and require the exact approved `--user-data-dir` immediately after Playwright
+connects and before this skill reads default-context storage or creates a search
+context. The CDP transport may enumerate target
+metadata while connecting, so the approved profile path remains credential-
+bearing. `--enable-automation` is required for the command-line proof.
+On POSIX it also requires current-user ownership and no group/other permissions.
+On Windows, place the profile under the `Temp` child of the LocalAppData Known
+Folder and restrict it with the user's NTFS ACL; the CLI cannot verify that ACL.
+In `--confirm-in-browser` mode, release browser
+control and wait
+while the user personally logs in, verifies the account, and types the visible
+one-time code into the local-only confirmation page. Never inspect, fill, click,
+or solve that confirmation page for the user. The connected Chrome remains
+user-owned. After the state-backed smoke test, have the user close that Chrome,
+then remove only the guarded exact profile:
+
+```bash
+python scripts/cdp_profile.py \
+  --directory /private/tmp/xianyu-cdp.EXACT \
+  --cleanup
+```
+
+Cleanup refuses an uninitialized/non-temporary directory, detected Chrome
+activity indicators, a still-listening debugging endpoint, or a platform
+without symlink-safe recursive removal. Concurrent launch is not safely
+supported: keep the close/check/cleanup sequence strictly serial and never
+relaunch that profile during cleanup. If automatic cleanup is unavailable, have the user
+move that exact directory to the operating-system Trash/File Manager. Never
+substitute a broad recursive-delete command.
+
+In the default confirmation mode, the command displays a one-time `SAVE-...`
+confirmation in the interactive terminal. When it appears, the agent must pause
+and wait for the user to provide that exact confirmation; the agent must never
+type, pipe, infer, or reuse it for the user. Non-interactive input, EOF, or a
+wrong token fail without saving. `--confirm-in-browser` moves the same deliberate
+confirmation into the local-only page described above and is the only mode that
+permits non-interactive command input. A login/challenge page, a missing
+navigation display-name field, or no retained Goofish browser-storage material
+also fails without saving.
 
 After confirmation, the command opens a fresh validation page and checks for
 the current PC navigation response's nonempty display-name field. Xianyu's
@@ -99,16 +175,19 @@ uses `0700`; a final output symlink is rejected.
 
 Its output keeps evidence dimensions separate:
 
-- `state.status: candidate-saved`: a private browser snapshot was saved.
+- `state.status: candidate-saved`: a private browser snapshot was saved to the
+  caller-selected path; the command does not echo that path.
 - `state.status: not-saved`: the publish is known not to have committed.
 - `state.status: not-established`: interruption or an OS error made the atomic
   publish result unknowable. Keep the named path secret and anomalous; do not
   inspect or use it, and do not claim that it was saved or absent.
-- `confirmation.status: interactive-token-received`: the terminal received the
-  one-time token. The program cannot determine whether the human or an agent
-  typed it.
+- `confirmation.status: interactive-token-received`: the configured terminal
+  or local browser confirmation channel received the one-time token. The
+  program cannot determine whether the human or an agent typed it.
 - `confirmation.actor: not-machine-verified`: the program cannot verify who
   typed the token.
+- `confirmation.channel`: `terminal` or `browser`; neither channel proves who
+  performed the confirmation.
 - `session.nav_display_name: present`: the current Goofish PC navigation
   response had a nonempty display-name field. This does not prove identity.
 - `authentication.status: not-established`: the command did not prove that the
@@ -172,6 +251,13 @@ python scripts/spider.py \
   --state /absolute/private/path/xianyu-state.json
 ```
 
+When the sandbox also cannot launch the search browser, keep the dedicated CDP
+Chrome open and add
+`--cdp-user-data-dir /private/tmp/xianyu-cdp.EXACT`. This mode still
+requires `--state`; it never treats the connected profile itself as implicit
+authorization or as a replacement for the filtered state file.
+For a literal one-attempt smoke test, also pass `--pages 1 --retries 1`.
+
 The command captures only the exact Xianyu search endpoint, advances using the
 real next-page control, deduplicates item IDs, applies price and location
 filters locally, and emits JSON.
@@ -179,6 +265,13 @@ filters locally, and emits JSON.
 Treat a nonzero exit code or `"ok": false` as failure. Never interpret failed
 or unreadable output as “no listings.” Stop after login challenges, CAPTCHA, or
 risk-control errors; do not attempt to bypass them.
+
+For a one-page, one-attempt smoke test, require all of: exit code `0`, parseable
+JSON, `ok: true`, `pages_scraped: 1`, `count == len(items)`,
+`search_capability.status: passed-for-this-run`, and
+`cleanup.status: complete-or-not-required`. Authentication and identity must
+still be `not-evaluated`; do not call the account verified or the state proven
+authenticated.
 
 If a supplied candidate state reaches `/search` but no search API is observed
 in headless mode, retry once with `--headed`. Do not loop headed attempts or
