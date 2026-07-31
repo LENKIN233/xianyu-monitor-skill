@@ -202,6 +202,22 @@ switch viewport, user agent, touch, or mobile settings. Search response routing
 blocks service workers so the exact API response remains observable; GET and
 POST are supported while preflight methods are ignored.
 
+The optional CDP transport separates browser ownership from credential input.
+Login capture may inspect the single default context of an explicitly dedicated
+temporary Chrome profile, then applies the same Goofish allowlist before atomic
+persistence. Search never consumes that default context: it requires an
+authorized state file and creates an isolated context inside the connected
+browser. Search explicitly closes that isolated context before disconnecting;
+the externally launched Chrome remains user-owned. An initialized sentinel,
+the loopback `DevToolsActivePort`, and Chrome's reported `--user-data-dir` bind
+the approved path immediately after transport connection and before application
+code reads default-context storage or creates a search context. The transport
+may enumerate target metadata while connecting. Default browser data
+directories, user-controlled symlink components, non-private POSIX directories,
+mismatched browser arguments, non-loopback endpoints, and ambiguous context
+sets fail closed. Standard operating-system temp-root aliases are canonicalized
+before these checks.
+
 Packaging and host integration remain optional:
 
 - `scripts/install_skill.py` maps one checkout to host discovery roots.

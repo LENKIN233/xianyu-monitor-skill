@@ -5,6 +5,7 @@
 - [spider.py](#spiderpy)
 - [task_manager.py](#task_managerpy)
 - [monitor.py](#monitorpy)
+- [cdp_profile.py](#cdp_profilepy)
 - [create_state.py](#create_statepy)
 - [login_state.py](#login_statepy)
 - [install_skill.py](#install_skillpy)
@@ -23,7 +24,8 @@ Search Xianyu once and emit a JSON object.
 --state, -s         Playwright state or enhanced snapshot
 --proxy             HTTP(S) or SOCKS proxy; may be visible in argv
 --proxy-file        Read the proxy URL from a user-private UTF-8 file
---browser-channel   Optional Playwright channel, such as chrome
+--browser-channel   Optional executable channel; does not reuse a profile
+--cdp-user-data-dir Connect through a dedicated private Chrome profile; requires --state
 --headed            Show the browser
 --retries, -r       Network/browser attempts; default 3
 --debug             Include applied filters in output
@@ -86,6 +88,12 @@ repeated headed attempts or add anti-detection bypasses.
 An `RGV587` rejection ends the run. Let the request/session cool down; account
 identity remains unknown. Do not re-login, rotate proxies, or make a headed
 retry in response to that code.
+
+`--browser-channel` and `--cdp-user-data-dir` are mutually exclusive. CDP
+search uses the supplied state in a new isolated context and treats the
+connected browser only as an externally launched engine. It never reads the
+connected default context as implicit login state. `--headed` does not control
+an externally launched CDP browser.
 
 ## `task_manager.py`
 
@@ -205,7 +213,8 @@ Run one or every active task:
 --state            Override the task state path
 --proxy            Proxy URL; may be visible in argv
 --proxy-file       Read the proxy URL from a user-private UTF-8 file
---browser-channel  Optional Playwright channel
+--browser-channel  Optional executable channel; does not reuse a profile
+--cdp-user-data-dir Connect through a dedicated private profile; requires state
 --headed           Show the browser
 --include-seen      Return all matches instead of only new listings
 --baseline          Store current matches as seen and report zero new listings
@@ -303,6 +312,33 @@ HTTP(S) credentials are split into Playwright's dedicated username and password
 fields. SOCKS5 is supported only without credentials; authenticated SOCKS5
 input fails explicitly rather than silently launching an unauthenticated proxy.
 
+## `cdp_profile.py`
+
+Initialize an already-created empty directory under an operating-system
+temporary root before using it as the dedicated CDP Chrome profile:
+
+```text
+--directory        Required exact temporary profile directory
+--cleanup          Remove that exact initialized profile after Chrome stops
+```
+
+The command refuses user-controlled symlink components and nonempty
+directories; a standard operating-system temp-root alias such as macOS `/var`
+to `/private/var` is accepted. On POSIX it also requires current-user ownership
+and no group/other permissions, then creates a `0600` sentinel. Initialization
+success reports
+`profile.status: initialized-empty-private`; guarded removal reports `removed`.
+Cleanup refuses detected Chrome activity indicators, a still-listening
+debugging endpoint, and platforms without symlink-safe recursive removal.
+Concurrent launch is unsupported; run close then cleanup strictly serially and
+do not relaunch the profile during cleanup. Validation failure reports
+`not-initialized` or `not-removed`;
+interruption/OS uncertainty reports `not-established` with failed cleanup.
+No result echoes the directory. On Windows, set a current-user-only NTFS ACL
+first; the command cannot verify it. The accepted Windows root is the `Temp`
+child of the LocalAppData path resolved by the Windows Known Folder API, not an
+environment-derived home or temp directory.
+
 ## `create_state.py`
 
 Accept exactly one input method:
@@ -332,18 +368,42 @@ Open a dedicated visible browser and save a candidate Playwright browser state:
 
 ```text
 --output, -o       Required private state-file path
---browser-channel  Optional installed browser channel, such as chrome
+--browser-channel  Optional executable channel; never reuses an existing profile
+--cdp-user-data-dir
+                   Connect through DevToolsActivePort in a dedicated private profile
+--confirm-in-browser
+                   Use a local-only visible confirmation page instead of terminal input
 --timeout          Login timeout in seconds (default 600)
 --force            Explicitly replace an existing state file
 ```
 
+`--browser-channel` and `--cdp-user-data-dir` are mutually exclusive. The CDP
+directory must be absolute, owned by the current user, private on POSIX, free of
+user-controlled symlink components, outside known default Chrome/Chromium data
+locations, and initialized under an operating-system temporary root while
+empty by `scripts/cdp_profile.py`. The command reads its sentinel and
+`DevToolsActivePort`, validates Chrome's loopback WebSocket path, and requires
+Chrome's CDP command line to report that exact `--user-data-dir` immediately
+after Playwright connects and before the skill reads default-context storage or
+creates a search context. The transport may enumerate target metadata while
+connecting. Launch Chrome with `--enable-automation` so it can provide the
+command-line proof. The command disconnects without closing the externally
+owned browser. Never attach a daily browser profile.
+
 The user must complete QR, OTP, password, and CAPTCHA interactions personally,
-open the account area, and visibly verify the intended account. The command
-then prints a random `SAVE-...` token to the interactive terminal. Agents must
-pause for the user to provide that exact token and must not enter or pipe it for
-them. Non-TTY input, EOF, a wrong token, login/challenge pages, an absent site
-navigation display-name field, and no retained Goofish browser-storage material
-fail without writing.
+open the account area, and visibly verify the intended account. In default mode
+the command prints a random `SAVE-...` token to the interactive terminal. Agents
+must pause for the user to provide that exact token and must not enter or pipe it
+for them. `--confirm-in-browser` instead presents the token on a local-only page
+and permits a non-TTY command; the agent must release that page to the user.
+Default-mode non-TTY input, EOF, a wrong token, login/challenge pages, an absent
+site navigation display-name field, and no retained Goofish browser-storage
+material fail without writing.
+
+Default-mode non-TTY failure includes a structured `handoff` object with
+`required: true`, `environment: normal-user-terminal`, and an `argv_template`
+array. Private state/CDP paths are placeholders, while argument boundaries are
+preserved. An agent must not inject the confirmation token on the user's behalf.
 
 Xianyu's current PC layout exposes that nonempty navigation field as a
 candidate session marker, but the command reports only the field's presence and
@@ -361,12 +421,12 @@ Success keeps evidence dimensions separate:
 {
   "ok": true,
   "state": {
-    "status": "candidate-saved",
-    "output": "/private/path/state.json"
+    "status": "candidate-saved"
   },
   "confirmation": {
     "status": "interactive-token-received",
-    "actor": "not-machine-verified"
+    "actor": "not-machine-verified",
+    "channel": "terminal"
   },
   "session": {"nav_display_name": "present"},
   "authentication": {"status": "not-established"},
@@ -383,20 +443,23 @@ path as a secret, anomalous candidate: do not use or inspect it, and do not
 claim it was either saved or absent.
 
 The confirmation status proves only that the interactive terminal received the
-token. If the user denies providing it, or an agent entered it, treat the output
-and any resulting file as anomalous and unusable. A successful controlled
-search later changes only search capability for that run. It does not
-machine-verify an account identity. Do not automate or bypass login challenges
-or risk control.
+token, or that the local confirmation page observed the matching token. The
+channel is `terminal` or `browser`; neither identifies the actor. In browser
+mode an agent must release browser control and must not inspect, fill, or click
+the confirmation page. If the user denies providing the confirmation, or an
+agent entered it, treat the output and any resulting file as anomalous and
+unusable. A successful controlled search later changes only search capability
+for that run. It does not machine-verify an account identity. Do not automate
+or bypass login challenges or risk control.
 
 The PC navigation response's nonempty display-name field is a candidate signal
 used by Xianyu's current layout, not identity proof. Its value is evaluated
 transiently and is not emitted or separately copied by the command. Before
 writing, the command removes all Cookies and origins outside `goofish.com`. The
 remaining site-created Goofish state is still a secret and may encode account
-data. The command's JSON and diagnostics echo the user-selected output path, so
-keep login-command logs local and never upload them with support bundles or CI
-artifacts.
+data. The command does not echo the selected output path or CDP profile path.
+Keep login-command logs local and never upload them with support bundles or CI
+artifacts anyway.
 
 ## `install_skill.py`
 

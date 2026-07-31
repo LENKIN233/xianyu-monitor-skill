@@ -32,6 +32,7 @@ REQUIRED_COPY_FILES = (
     "references/host_adapters.md",
     "requirements.txt",
     "scripts/__init__.py",
+    "scripts/cdp_profile.py",
     "scripts/create_state.py",
     "scripts/install_skill.py",
     "scripts/login_state.py",

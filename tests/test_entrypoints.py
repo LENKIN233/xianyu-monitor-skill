@@ -53,6 +53,25 @@ def test_login_state_script_help_from_foreign_working_directory(
 
     assert result.returncode == 0
     assert "--browser-channel" in result.stdout
+    assert "--cdp-user-data-dir" in result.stdout
+    assert "--confirm-in-browser" in result.stdout
+
+
+def test_cdp_profile_script_help_from_foreign_working_directory(
+    tmp_path: Path,
+) -> None:
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(ROOT / "scripts/cdp_profile.py"), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "--directory" in result.stdout
+    assert "--cleanup" in result.stdout
 
 
 def test_json_stdout_is_ascii_safe_under_restrictive_encoding(

@@ -9,7 +9,9 @@ import json
 import math
 import os
 import re
+import stat
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,6 +54,358 @@ NEXT_PAGE_SELECTOR = (
 DEFAULT_TIMEOUT_MS = 30_000
 PAGINATION_WAIT_MS = 5_000
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+CDP_PROFILE_SENTINEL_NAME = ".xianyu-monitor-cdp-profile"
+CDP_PROFILE_SENTINEL_VALUE = "xianyu-monitor dedicated cdp profile v1\n"
+
+
+def _read_small_profile_file(profile: Path, name: str, max_bytes: int) -> str:
+    """Read one regular profile file without following a POSIX symlink race."""
+
+    if Path(name).name != name or max_bytes < 1:
+        raise ValueError("invalid private profile file request")
+    if os.name == "nt":
+        path = profile / name
+        try:
+            before = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(before.st_mode):
+                raise ValueError("invalid private profile marker")
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        except OSError as exc:
+            raise ValueError("unable to read private profile marker") from exc
+        try:
+            after = os.fstat(descriptor)
+            if not os.path.samestat(before, after) or after.st_size > max_bytes:
+                raise ValueError("invalid private profile marker")
+            payload = os.read(descriptor, max_bytes + 1)
+        finally:
+            os.close(descriptor)
+    else:
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        file_flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_flags |= getattr(os, "O_NONBLOCK", 0)
+        try:
+            expected_directory = profile.stat()
+            directory_descriptor = os.open(profile, directory_flags)
+            try:
+                actual_directory = os.fstat(directory_descriptor)
+                if not os.path.samestat(expected_directory, actual_directory):
+                    raise ValueError("private profile directory changed during read")
+                descriptor = os.open(
+                    name,
+                    file_flags,
+                    dir_fd=directory_descriptor,
+                )
+            finally:
+                os.close(directory_descriptor)
+        except OSError as exc:
+            raise ValueError("unable to read private profile marker") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+                raise ValueError("invalid private profile marker")
+            if metadata.st_uid != os.getuid():
+                raise ValueError("private profile marker must be user-owned")
+            payload = os.read(descriptor, max_bytes + 1)
+        finally:
+            os.close(descriptor)
+    if len(payload) > max_bytes:
+        raise ValueError("invalid private profile marker")
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("invalid private profile marker") from exc
+
+
+def _same_existing_path(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
+
+
+def _windows_local_app_data() -> Path:
+    """Resolve LocalAppData through the Windows Known Folder API."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    class Guid(ctypes.Structure):
+        _fields_ = [
+            ("data1", wintypes.DWORD),
+            ("data2", wintypes.WORD),
+            ("data3", wintypes.WORD),
+            ("data4", ctypes.c_ubyte * 8),
+        ]
+
+    folder_id = Guid(
+        0xF1B32785,
+        0x6FBA,
+        0x4FCF,
+        (ctypes.c_ubyte * 8)(0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91),
+    )
+    raw_path = ctypes.c_void_p()
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    shell32.SHGetKnownFolderPath.argtypes = [
+        ctypes.POINTER(Guid),
+        wintypes.DWORD,
+        wintypes.HANDLE,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoUninitialize.restype = None
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ole32.CoTaskMemFree.restype = None
+    com_result = ole32.CoInitializeEx(None, 0x2)
+    changed_mode = ctypes.c_int32(0x80010106).value
+    if com_result not in {0, 1, changed_mode}:
+        raise OSError("unable to initialize Windows known-folder resolution")
+    uninitialize = com_result in {0, 1}
+    try:
+        result = shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id),
+            0,
+            None,
+            ctypes.byref(raw_path),
+        )
+        if result != 0 or raw_path.value is None:
+            raise OSError("unable to resolve the Windows LocalAppData known folder")
+        return Path(ctypes.wstring_at(raw_path.value))
+    finally:
+        ole32.CoTaskMemFree(raw_path)
+        if uninitialize:
+            ole32.CoUninitialize()
+
+
+def _command_line_uses_profile(arguments: Any, expected_profile: Path) -> bool:
+    """Verify Chrome reports the exact approved --user-data-dir argument."""
+
+    if not isinstance(arguments, list) or not all(
+        isinstance(argument, str) for argument in arguments
+    ):
+        return False
+    candidates: list[str] = []
+    for index, argument in enumerate(arguments):
+        if argument.startswith("--user-data-dir="):
+            candidates.append(argument.partition("=")[2])
+        elif argument == "--user-data-dir" and index + 1 < len(arguments):
+            candidates.append(arguments[index + 1])
+    if len(candidates) != 1:
+        return False
+    reported = Path(candidates[0]).expanduser()
+    return reported.is_absolute() and _same_existing_path(reported, expected_profile)
+
+
+def _windows_cdp_temp_root_aliases() -> tuple[tuple[Path, Path], ...]:
+    """Trust Known Folder redirection, but never a reparse of its Temp child."""
+
+    lexical_base = _windows_local_app_data().expanduser().absolute()
+    canonical_base = lexical_base.resolve(strict=False)
+    lexical_root = lexical_base / "Temp"
+    canonical_root = canonical_base / "Temp"
+    if lexical_root.resolve(strict=False) != canonical_root:
+        raise ValueError("Windows LocalAppData Temp must not be a reparse point")
+    aliases = [(lexical_root, canonical_root)]
+    canonical_pair = (canonical_root, canonical_root)
+    if canonical_pair not in aliases:
+        aliases.append(canonical_pair)
+    return tuple(aliases)
+
+
+def _temporary_cdp_root_aliases() -> tuple[tuple[Path, Path], ...]:
+    """Return approved lexical temp roots paired with canonical paths."""
+
+    if os.name == "nt":
+        return _windows_cdp_temp_root_aliases()
+
+    roots = [
+        Path("/tmp"),  # noqa: S108
+        Path("/var/tmp"),  # noqa: S108
+    ]
+    if hasattr(os, "getuid"):
+        roots.append(Path("/run/user") / str(os.getuid()))
+    if sys.platform == "darwin":
+        configured = Path(tempfile.gettempdir()).expanduser().absolute()
+        canonical = configured.resolve(strict=False)
+        try:
+            relative = canonical.relative_to("/private/var/folders")
+        except ValueError:
+            pass
+        else:
+            if len(relative.parts) == 3 and relative.parts[-1] == "T":
+                roots.append(configured)
+
+    aliases: list[tuple[Path, Path]] = []
+    for root in roots:
+        lexical = root.expanduser().absolute()
+        canonical = lexical.resolve(strict=False)
+        pair = (lexical, canonical)
+        if pair not in aliases:
+            aliases.append(pair)
+        canonical_pair = (canonical, canonical)
+        if canonical_pair not in aliases:
+            aliases.append(canonical_pair)
+    return tuple(aliases)
+
+
+def _require_temporary_cdp_path(profile: Path) -> None:
+    roots = {canonical for _, canonical in _temporary_cdp_root_aliases()}
+    if not any(profile != root and profile.is_relative_to(root) for root in roots):
+        raise ValueError(
+            "CDP user-data directory must be inside an operating-system "
+            "temporary directory"
+        )
+
+
+def _resolve_temporary_cdp_directory(user_data_dir: str) -> Path:
+    """Resolve a CDP directory while allowing only trusted temp-root aliases."""
+
+    requested = Path(user_data_dir).expanduser()
+    if not requested.is_absolute():
+        raise ValueError("CDP user-data directory must be an absolute path")
+    try:
+        resolved = requested.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("CDP user-data directory does not exist") from exc
+
+    lexical = requested.absolute()
+    if resolved != lexical:
+        trusted_alias = False
+        for lexical_root, canonical_root in _temporary_cdp_root_aliases():
+            try:
+                relative = lexical.relative_to(lexical_root)
+            except ValueError:
+                continue
+            if relative.parts and canonical_root.joinpath(relative) == resolved:
+                trusted_alias = True
+                break
+        if not trusted_alias:
+            raise ValueError("CDP user-data directory must not traverse symlinks")
+    if not resolved.is_dir():
+        raise ValueError("CDP user-data path must be a directory")
+    _require_temporary_cdp_path(resolved)
+    return resolved
+
+
+def _private_cdp_profile_path(user_data_dir: str) -> Path:
+    """Validate an explicitly dedicated, user-private Chromium profile."""
+
+    resolved = _resolve_temporary_cdp_directory(user_data_dir)
+
+    home = Path.home()
+    default_roots: list[Path] = []
+    if sys.platform == "darwin":
+        default_roots.extend(
+            [
+                home / "Library/Application Support/Google/Chrome",
+                home / "Library/Application Support/Chromium",
+                home / "Library/Application Support/Google/Chrome for Testing",
+            ]
+        )
+    elif os.name == "nt":
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            base = Path(local_app_data)
+            default_roots.extend(
+                [
+                    base / "Google/Chrome/User Data",
+                    base / "Chromium/User Data",
+                ]
+            )
+    else:
+        config_home = Path(os.getenv("XDG_CONFIG_HOME", home / ".config"))
+        default_roots.extend([config_home / "google-chrome", config_home / "chromium"])
+    for default_root in default_roots:
+        candidate_root = default_root.expanduser().resolve(strict=False)
+        lexical_match = resolved == candidate_root or resolved.is_relative_to(
+            candidate_root
+        )
+        identity_match = any(
+            _same_existing_path(ancestor, candidate_root)
+            for ancestor in (resolved, *resolved.parents)
+        )
+        if lexical_match or identity_match:
+            raise ValueError("refusing to use a default browser profile for CDP")
+
+    if os.name != "nt":
+        metadata = resolved.stat()
+        if metadata.st_uid != os.getuid():
+            raise ValueError(
+                "CDP user-data directory must be owned by the current user"
+            )
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise ValueError(
+                "CDP user-data directory must be private; run chmod 700 on it"
+            )
+    try:
+        sentinel = _read_small_profile_file(
+            resolved,
+            CDP_PROFILE_SENTINEL_NAME,
+            128,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "CDP profile was not initialized by scripts/cdp_profile.py"
+        ) from exc
+    if sentinel != CDP_PROFILE_SENTINEL_VALUE:
+        raise ValueError("invalid dedicated CDP profile sentinel")
+    return resolved
+
+
+def _cdp_endpoint_from_user_data_dir(
+    user_data_dir: str,
+    *,
+    timeout_seconds: float = 15.0,
+) -> str:
+    """Read Chrome's loopback endpoint from a dedicated profile marker."""
+
+    profile = _private_cdp_profile_path(user_data_dir)
+    marker = profile / "DevToolsActivePort"
+    deadline = time.monotonic() + max(timeout_seconds, 0)
+    while True:
+        try:
+            marker.lstat()
+            break
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ValueError("unable to inspect DevToolsActivePort") from exc
+        if time.monotonic() >= deadline:
+            raise ValueError(
+                "dedicated Chrome is not ready; DevToolsActivePort was not found"
+            )
+        time.sleep(0.1)
+    try:
+        lines = _read_small_profile_file(
+            profile,
+            "DevToolsActivePort",
+            1024,
+        ).splitlines()
+    except ValueError as exc:
+        raise ValueError("unable to read DevToolsActivePort") from exc
+    if len(lines) != 2:
+        raise ValueError("invalid DevToolsActivePort marker")
+    try:
+        port = int(lines[0])
+    except ValueError as exc:
+        raise ValueError("invalid DevToolsActivePort marker") from exc
+    browser_path = lines[1]
+    if (
+        not 1 <= port <= 65535
+        or re.fullmatch(
+            r"/devtools/browser/[A-Za-z0-9._-]+",
+            browser_path,
+        )
+        is None
+    ):
+        raise ValueError("invalid DevToolsActivePort marker")
+    return f"ws://127.0.0.1:{port}{browser_path}"
 
 
 class SpiderError(RuntimeError):
@@ -60,6 +414,35 @@ class SpiderError(RuntimeError):
 
 class DependencyError(SpiderError):
     """Raised when a required runtime dependency is missing."""
+
+
+class BrowserConnectionError(SpiderError):
+    """Raised when a dedicated local CDP browser cannot be reached."""
+
+
+async def _verify_async_cdp_profile(browser: Any, expected_profile: Path) -> None:
+    """Fail closed unless Chrome proves which user-data directory it uses."""
+
+    session: Any | None = None
+    try:
+        session = await browser.new_browser_cdp_session()
+        payload = await session.send("Browser.getBrowserCommandLine")
+    except PlaywrightError as exc:
+        raise BrowserConnectionError(
+            "connected Chrome could not prove its dedicated user-data directory; "
+            "restart it with --enable-automation"
+        ) from exc
+    finally:
+        if session is not None:
+            try:
+                await session.detach()
+            except PlaywrightError:
+                pass
+    arguments = payload.get("arguments") if isinstance(payload, dict) else None
+    if not _command_line_uses_profile(arguments, expected_profile):
+        raise BrowserConnectionError(
+            "connected Chrome did not use the approved dedicated user-data directory"
+        )
 
 
 class StateFileError(SpiderError):
@@ -881,6 +1264,20 @@ def resolve_proxy(proxy: str | None, proxy_file: str | None = None) -> str | Non
     return value or None
 
 
+def _resolve_browser_channel(
+    explicit_channel: str | None,
+    cdp_user_data_dir: str | None,
+) -> str | None:
+    """Apply the environment default only when CDP was not selected explicitly."""
+
+    if explicit_channel:
+        return explicit_channel
+    if cdp_user_data_dir:
+        return None
+    configured = os.getenv("XIANYU_BROWSER_CHANNEL", "").strip()
+    return configured or None
+
+
 def _load_state_file(
     state_file: str | None,
 ) -> tuple[dict[str, Any] | str | None, dict[str, Any], dict[str, str]]:
@@ -1101,13 +1498,31 @@ class XianyuSpider:
         *,
         headless: bool = True,
         browser_channel: str | None = None,
+        cdp_user_data_dir: str | None = None,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         verbose: bool = True,
     ):
+        if browser_channel and cdp_user_data_dir:
+            raise ValueError(
+                "--browser-channel and --cdp-user-data-dir are mutually exclusive"
+            )
+        if cdp_user_data_dir and not state_file:
+            raise ValueError(
+                "--cdp-user-data-dir requires --state; capture candidate state first"
+            )
         self.state_file = state_file
         self.proxy_settings = build_proxy_settings(proxy) if proxy else None
         self.headless = headless
         self.browser_channel = browser_channel
+        self.cdp_user_data_dir = (
+            str(_private_cdp_profile_path(cdp_user_data_dir))
+            if cdp_user_data_dir
+            else None
+        )
+        if self.cdp_user_data_dir and state_file:
+            state_path = Path(state_file).expanduser().resolve(strict=False)
+            if state_path.is_relative_to(Path(self.cdp_user_data_dir)):
+                raise ValueError("--state must be outside the CDP profile")
         self.timeout_ms = timeout_ms
         self.verbose = verbose
         self.rate_limiter = RateLimiter()
@@ -1191,6 +1606,7 @@ class XianyuSpider:
                 raise
             except (
                 BrowserCleanupError,
+                BrowserConnectionError,
                 SearchCaptureError,
                 SearchRejectedError,
                 StateFileError,
@@ -1230,6 +1646,10 @@ class XianyuSpider:
                 "python -m playwright install chromium"
             )
 
+        if self.cdp_user_data_dir and self.state_file:
+            current_state = Path(self.state_file).expanduser().resolve(strict=False)
+            if current_state.is_relative_to(Path(self.cdp_user_data_dir)):
+                raise ValueError("--state must be outside the CDP profile")
         storage_state, context_overrides, extra_headers = _load_state_file(
             self.state_file
         )
@@ -1243,6 +1663,7 @@ class XianyuSpider:
         playwright_manager = async_playwright()
         playwright: Any | None = None
         browser: Any | None = None
+        context: Any | None = None
         try:
             try:
                 playwright = await playwright_manager.start()
@@ -1252,20 +1673,42 @@ class XianyuSpider:
                 await _cleanup_interrupted_playwright_start(playwright_manager, exc)
                 raise
 
-            launch_kwargs: dict[str, Any] = {"headless": self.headless}
-            if self.proxy_settings:
-                launch_kwargs["proxy"] = self.proxy_settings
-                self._log(f"[proxy] using {self.proxy_settings['server']}")
-            if self.browser_channel:
-                launch_kwargs["channel"] = self.browser_channel
-
-            browser = await playwright.chromium.launch(**launch_kwargs)
+            if self.cdp_user_data_dir:
+                cdp_endpoint = _cdp_endpoint_from_user_data_dir(
+                    self.cdp_user_data_dir,
+                    timeout_seconds=0,
+                )
+                try:
+                    browser = await playwright.chromium.connect_over_cdp(
+                        cdp_endpoint,
+                        timeout=min(max(self.timeout_ms, 1), 60_000),
+                    )
+                except PlaywrightError as exc:
+                    raise BrowserConnectionError(
+                        "unable to connect to the dedicated local Chrome browser"
+                    ) from exc
+                await _verify_async_cdp_profile(
+                    browser,
+                    Path(self.cdp_user_data_dir),
+                )
+                self._log("[browser] connected to dedicated local Chrome")
+            else:
+                launch_kwargs: dict[str, Any] = {"headless": self.headless}
+                if self.proxy_settings:
+                    launch_kwargs["proxy"] = self.proxy_settings
+                    self._log(f"[proxy] using {self.proxy_settings['server']}")
+                if self.browser_channel:
+                    launch_kwargs["channel"] = self.browser_channel
+                browser = await playwright.chromium.launch(**launch_kwargs)
             if browser is not None:
                 context_kwargs = _context_options(
                     storage_state,
                     context_overrides,
                     extra_headers,
                 )
+                if self.cdp_user_data_dir and self.proxy_settings:
+                    context_kwargs["proxy"] = self.proxy_settings
+                    self._log(f"[proxy] using {self.proxy_settings['server']}")
 
                 context = await browser.new_context(**context_kwargs)
                 collector = SearchResponseCollector(keyword)
@@ -1282,7 +1725,7 @@ class XianyuSpider:
                         search_url=search_url,
                         timeout_ms=self.timeout_ms,
                         state_supplied=storage_state is not None,
-                        headless=self.headless,
+                        headless=self.headless and not self.cdp_user_data_dir,
                     )
                     try:
                         capture = await collector.next(ticket, self.timeout_ms)
@@ -1295,7 +1738,7 @@ class XianyuSpider:
                         headed_hint = (
                             "; Xianyu may suppress search requests in headless mode; "
                             "retry once with --headed"
-                            if self.headless
+                            if self.headless and not self.cdp_user_data_dir
                             else ""
                         )
                         raise SearchCaptureError(
@@ -1323,12 +1766,12 @@ class XianyuSpider:
                         break
         finally:
             try:
-                if browser is not None:
+                if self.cdp_user_data_dir and context is not None:
                     primary_error = sys.exc_info()[1]
                     try:
-                        await browser.close()
+                        await context.close()
                     except BaseException as exc:  # noqa: BLE001
-                        message = "failed to close the dedicated search browser"
+                        message = "failed to close the isolated search context"
                         if not isinstance(exc, Exception):
                             capability_status = (
                                 search_capability_status(primary_error)
@@ -1358,40 +1801,80 @@ class XianyuSpider:
                                 search_passed=True,
                             ) from exc
             finally:
-                if playwright is not None:
-                    primary_error = sys.exc_info()[1]
-                    try:
-                        await playwright.stop()
-                    except BaseException as exc:  # noqa: BLE001
-                        message = "failed to stop the dedicated browser runtime"
-                        if not isinstance(exc, Exception):
-                            capability_status = (
-                                search_capability_status(primary_error)
-                                if primary_error is not None
-                                else "passed-for-this-run"
+                try:
+                    if browser is not None:
+                        primary_error = sys.exc_info()[1]
+                        try:
+                            await browser.close()
+                        except BaseException as exc:  # noqa: BLE001
+                            message = (
+                                "failed to disconnect from the connected search browser"
+                                if self.cdp_user_data_dir
+                                else "failed to close the dedicated search browser"
                             )
-                            self.last_capability_status = capability_status
-                            setattr(exc, "capability_status", capability_status)
-                            if primary_error is not None:
-                                for failure in getattr(
-                                    primary_error,
-                                    "cleanup_failures",
-                                    [],
-                                ):
-                                    _append_cleanup_failure(exc, failure)
-                                if capability_status == "passed-for-this-run":
+                            if not isinstance(exc, Exception):
+                                capability_status = (
+                                    search_capability_status(primary_error)
+                                    if primary_error is not None
+                                    else "passed-for-this-run"
+                                )
+                                self.last_capability_status = capability_status
+                                setattr(exc, "capability_status", capability_status)
+                                if primary_error is not None:
+                                    for failure in getattr(
+                                        primary_error,
+                                        "cleanup_failures",
+                                        [],
+                                    ):
+                                        _append_cleanup_failure(exc, failure)
+                                    if capability_status == "passed-for-this-run":
+                                        setattr(exc, "search_passed", True)
+                                else:
                                     setattr(exc, "search_passed", True)
+                                _append_cleanup_failure(exc, message)
+                                raise
+                            if primary_error is not None:
+                                _append_cleanup_failure(primary_error, message)
                             else:
-                                setattr(exc, "search_passed", True)
-                            _append_cleanup_failure(exc, message)
-                            raise
-                        if primary_error is not None:
-                            _append_cleanup_failure(primary_error, message)
-                        else:
-                            raise BrowserCleanupError(
-                                message,
-                                search_passed=True,
-                            ) from exc
+                                raise BrowserCleanupError(
+                                    message,
+                                    search_passed=True,
+                                ) from exc
+                finally:
+                    if playwright is not None:
+                        primary_error = sys.exc_info()[1]
+                        try:
+                            await playwright.stop()
+                        except BaseException as exc:  # noqa: BLE001
+                            message = "failed to stop the dedicated browser runtime"
+                            if not isinstance(exc, Exception):
+                                capability_status = (
+                                    search_capability_status(primary_error)
+                                    if primary_error is not None
+                                    else "passed-for-this-run"
+                                )
+                                self.last_capability_status = capability_status
+                                setattr(exc, "capability_status", capability_status)
+                                if primary_error is not None:
+                                    for failure in getattr(
+                                        primary_error,
+                                        "cleanup_failures",
+                                        [],
+                                    ):
+                                        _append_cleanup_failure(exc, failure)
+                                    if capability_status == "passed-for-this-run":
+                                        setattr(exc, "search_passed", True)
+                                else:
+                                    setattr(exc, "search_passed", True)
+                                _append_cleanup_failure(exc, message)
+                                raise
+                            if primary_error is not None:
+                                _append_cleanup_failure(primary_error, message)
+                            else:
+                                raise BrowserCleanupError(
+                                    message,
+                                    search_passed=True,
+                                ) from exc
 
         return items
 
@@ -1645,10 +2128,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--proxy-file",
         help="read proxy URL from a user-private UTF-8 file",
     )
-    parser.add_argument(
+    browser_group = parser.add_mutually_exclusive_group()
+    browser_group.add_argument(
         "--browser-channel",
-        default=os.getenv("XIANYU_BROWSER_CHANNEL"),
-        help="Playwright browser channel, for example chrome",
+        help=(
+            "Playwright browser executable channel, for example chrome; "
+            "does not reuse an existing Chrome profile"
+        ),
+    )
+    browser_group.add_argument(
+        "--cdp-user-data-dir",
+        help=(
+            "connect through DevToolsActivePort in an explicitly dedicated, "
+            "private Chrome user-data directory; requires --state"
+        ),
     )
     parser.add_argument("--headed", action="store_true", help="show the browser")
     parser.add_argument("--debug", action="store_true", help="enable debug metadata")
@@ -1661,13 +2154,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    browser_channel = _resolve_browser_channel(
+        args.browser_channel,
+        args.cdp_user_data_dir,
+    )
     spider: XianyuSpider | None = None
     try:
         spider = XianyuSpider(
             state_file=args.state,
             proxy=resolve_proxy(args.proxy, args.proxy_file),
             headless=not args.headed,
-            browser_channel=args.browser_channel,
+            browser_channel=browser_channel,
+            cdp_user_data_dir=args.cdp_user_data_dir,
             verbose=not args.quiet,
         )
         spider.debug = args.debug
