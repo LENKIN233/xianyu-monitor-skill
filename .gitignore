@@ -11,7 +11,6 @@
 .*tasks*.json*.tmp/
 results.json
 results_test.json
-!scripts/state_example.json
 
 # Logs
 *.log

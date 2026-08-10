@@ -3,6 +3,16 @@
 The scraper and task store do not depend on an agent runtime. This file maps the
 same Agent Skills directory and one-shot monitor command to common hosts.
 
+## Contents
+
+- [Discovery paths](#discovery-paths)
+- [Install from one checkout](#install-from-one-checkout)
+- [Generic scheduler](#generic-scheduler)
+- [Codex](#codex)
+- [Claude Code](#claude-code)
+- [OpenClaw](#openclaw)
+- [Upgrade strategy](#upgrade-strategy)
+
 ## Discovery paths
 
 | Host | User skill directory | Explicit invocation |
@@ -10,7 +20,7 @@ same Agent Skills directory and one-shot monitor command to common hosts.
 | Codex | `~/.agents/skills/xianyu-monitor` | `$xianyu-monitor` |
 | Claude Code | `~/.claude/skills/xianyu-monitor` | `/xianyu-monitor` |
 | OpenClaw | `~/.agents/skills/xianyu-monitor` | `/skill xianyu-monitor` |
-| Plain CLI | Any directory | Run `scripts/*.py` |
+| Plain CLI | Any directory | Run `.venv/bin/python scripts/xianyu.py COMMAND` |
 
 Codex and OpenClaw share the current `~/.agents/skills` convention. OpenClaw
 also loads workspace `skills/`, project `.agents/skills`, and
@@ -25,13 +35,13 @@ destination or use the installer below.
 Preview a shared Codex/OpenClaw install plus a Claude Code install:
 
 ```bash
-python scripts/install_skill.py --host all --mode symlink --dry-run
+.venv/bin/python scripts/xianyu.py install --host all --mode symlink --dry-run
 ```
 
 Install:
 
 ```bash
-python scripts/install_skill.py --host all --mode symlink
+.venv/bin/python scripts/xianyu.py install --host all --mode symlink
 ```
 
 The command creates at most two entries:
@@ -41,10 +51,10 @@ The command creates at most two entries:
 
 It never replaces an existing file, directory, or unrelated symlink. Use
 `--mode copy` when directory symlinks are unavailable. Copy mode installs only
-runtime and documentation files, not `.git`, virtual environments, caches,
-tests, or local task/state files. A multi-target failure rolls back targets
-created by that invocation. Mode changes are explicit: a copy request refuses
-an existing symlink instead of reporting it as a copy install.
+runtime, Skill references/metadata, and the license—not the repository README,
+`.git`, virtual environments, caches, tests, or local task/state files. A
+multi-target failure rolls back targets created by that invocation. Mode changes
+are explicit: copy refuses an existing symlink instead of misreporting it.
 
 After a copy install, prepare the virtual environment inside each independent
 copy. A symlink install shares one checkout and one virtual environment.
@@ -55,7 +65,7 @@ Every scheduler should run one process and inspect its exit code. Use
 `--quiet-if-empty` only when the scheduler interprets stdout as a notification:
 
 ```cron
-*/30 * * * * cd /absolute/path/xianyu-monitor && /absolute/path/xianyu-monitor/.venv/bin/python scripts/monitor.py --tasks-file /absolute/private/path/tasks.json --task-id TASK_ID --state /absolute/private/path/xianyu-state.json --quiet-if-empty
+*/30 * * * * cd /absolute/path/xianyu-monitor && /absolute/path/xianyu-monitor/.venv/bin/python scripts/xianyu.py monitor --tasks-file /absolute/private/path/tasks.json --task-id TASK_ID --state /absolute/private/path/xianyu-state.json --quiet-if-empty
 ```
 
 The same command can be configured in `systemd`, `launchd`, Windows Task
@@ -81,8 +91,8 @@ replaying every current match is intentional.
 
 For Windows Task Scheduler, use the absolute executable
 `C:\path\xianyu-monitor\.venv\Scripts\python.exe`, pass the absolute
-`scripts\monitor.py` path and task-file arguments, and set “Start in” to the
-skill directory.
+`scripts\xianyu.py` path followed by `monitor` and the task-file arguments, and
+set “Start in” to the skill directory.
 
 Windows Task Scheduler by itself neither interprets `criteria` nor delivers
 stdout as a notification. Use it only for deterministic collection, configure
@@ -111,8 +121,8 @@ authentication, so do not expose a browser to a cloud or local sandbox through
 a debugging port. The hidden legacy `--cdp-user-data-dir` flag returns
 structured `ArgumentError` JSON and exit `2`; it never connects.
 
-When a sandbox cannot launch Chromium, run the complete `login_state.py`,
-`spider.py`, and `monitor.py` workflow on the browser-owning host with
+When a sandbox cannot launch Chromium, run the complete `xianyu.py login`,
+`xianyu.py search`, and `xianyu.py monitor` workflow on the browser-owning host with
 `--browser-channel chrome`. Keep the exact login-state file there with POSIX
 `0600` permissions (or a current-user-only Windows ACL), and configure only its
 path in that trusted host's task or scheduler. The sandboxed agent may receive
@@ -148,11 +158,9 @@ For a recurring Codex task, use the host's scheduling UI and a prompt with
 absolute paths:
 
 ```text
-Use $xianyu-monitor. From /absolute/path/xianyu-monitor, run TASK_ID from
-/absolute/private/path/tasks.json. The user explicitly authorized this
-recurring job to read /absolute/private/path/xianyu-state.json solely for Xianyu
-search. Pass that path as --state so authorization cannot expand through later
-task-file edits. Never reveal that state. Parse the JSON, evaluate each task's
+Use $xianyu-monitor. From /absolute/path/xianyu-monitor, execute exactly: /absolute/path/xianyu-monitor/.venv/bin/python scripts/xianyu.py monitor --tasks-file /absolute/private/path/tasks.json --task-id TASK_ID --state /absolute/private/path/xianyu-state.json
+The user explicitly authorized this recurring job to read those exact files
+solely for Xianyu search. Never reveal the state. Parse the JSON, evaluate each task's
 criteria only against captured fields, label missing evidence as uncertain,
 exclude only listings that captured evidence proves fail a required criterion,
 report the remaining newly observed listings, stay silent when new_count is
@@ -184,8 +192,8 @@ skip skill discovery. Pin both the prompt and Bash permission to one exact
 command:
 
 ```bash
-claude -p "/xianyu-monitor Execute exactly: /absolute/path/xianyu-monitor/.venv/bin/python scripts/monitor.py --tasks-file /absolute/private/path/tasks.json --task-id TASK_ID --state /absolute/private/path/xianyu-state.json. This recurring read was explicitly authorized solely for Xianyu search. Evaluate criteria only against captured fields, report new matches, stay silent on zero, and report every failure." \
-  --allowedTools "Bash(/absolute/path/xianyu-monitor/.venv/bin/python scripts/monitor.py --tasks-file /absolute/private/path/tasks.json --task-id TASK_ID --state /absolute/private/path/xianyu-state.json)" \
+claude -p "/xianyu-monitor Execute exactly: /absolute/path/xianyu-monitor/.venv/bin/python scripts/xianyu.py monitor --tasks-file /absolute/private/path/tasks.json --task-id TASK_ID --state /absolute/private/path/xianyu-state.json. This recurring read was explicitly authorized solely for Xianyu search. Evaluate criteria only against captured fields, report new matches, stay silent on zero, and report every failure." \
+  --allowedTools "Bash(/absolute/path/xianyu-monitor/.venv/bin/python scripts/xianyu.py monitor --tasks-file /absolute/private/path/tasks.json --task-id TASK_ID --state /absolute/private/path/xianyu-state.json)" \
   --permission-mode dontAsk \
   --output-format text
 ```
@@ -219,7 +227,7 @@ in an explicit delivery target when needed:
 ```bash
 openclaw cron create "*/30 * * * *" \
   --name "xianyu-monitor" \
-  --command-argv '["/absolute/path/xianyu-monitor/.venv/bin/python","scripts/monitor.py","--tasks-file","/absolute/private/path/tasks.json","--task-id","TASK_ID","--state","/absolute/private/path/xianyu-state.json","--quiet-if-empty"]' \
+  --command-argv '["/absolute/path/xianyu-monitor/.venv/bin/python","scripts/xianyu.py","monitor","--tasks-file","/absolute/private/path/tasks.json","--task-id","TASK_ID","--state","/absolute/private/path/xianyu-state.json","--quiet-if-empty"]' \
   --command-cwd "/absolute/path/xianyu-monitor" \
   --announce
 ```

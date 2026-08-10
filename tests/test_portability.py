@@ -24,16 +24,28 @@ def test_core_skill_has_no_host_specific_path_or_silence_tokens() -> None:
     assert "references/host_adapters.md" in text
 
 
+def test_core_skill_uses_progressive_disclosure_and_unified_cli() -> None:
+    text = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+    assert len(text.splitlines()) <= 220
+    assert len(text.split()) <= 1_300
+    assert "scripts/xianyu.py" in text
+    assert "references/api_reference.md" in text
+    assert "references/architecture.md" in text
+
+
 def test_every_referenced_skill_resource_exists() -> None:
     for relative_path in (
         "references/api_reference.md",
         "references/architecture.md",
         "references/host_adapters.md",
+        "scripts/cdp_profile.py",
         "scripts/create_state.py",
         "scripts/doctor.py",
         "scripts/login_state.py",
         "scripts/monitor.py",
         "scripts/spider.py",
         "scripts/task_manager.py",
+        "scripts/xianyu.py",
     ):
         assert (ROOT / relative_path).exists(), relative_path
