@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import install_skill as installer
@@ -52,6 +54,7 @@ def test_all_hosts_share_two_symlink_targets(tmp_path: Path) -> None:
 def test_copy_mode_uses_distributable_allowlist(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _make_complete_source(source)
+    (source / "README.md").write_text("repository documentation\n", encoding="utf-8")
     (source / "tests").mkdir()
     (source / "scripts/state.json").write_text('{"cookies": []}\n', encoding="utf-8")
     (source / "tests/secret.txt").write_text("not copied\n", encoding="utf-8")
@@ -66,13 +69,41 @@ def test_copy_mode_uses_distributable_allowlist(tmp_path: Path) -> None:
     )
 
     target = home / ".claude/skills/xianyu-monitor"
+    assert (target / "LICENSE").is_file()
     assert (target / "SKILL.md").is_file()
     assert (target / "scripts/cdp_profile.py").is_file()
     assert (target / "scripts/doctor.py").is_file()
     assert (target / "scripts/monitor.py").is_file()
+    assert (target / "scripts/xianyu.py").is_file()
+    assert not (target / "README.md").exists()
     assert not (target / "scripts/state.json").exists()
     assert not (target / "tests").exists()
     assert not (target / "tasks.json").exists()
+
+
+def test_copy_install_unified_cli_runs_from_foreign_directory(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    install_skill(
+        source=source,
+        home=home,
+        hosts=["claude"],
+        mode="copy",
+    )
+    entrypoint = home / ".claude/skills/xianyu-monitor/scripts/xianyu.py"
+
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(entrypoint), "task", "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.splitlines()[0].startswith("usage: xianyu.py task")
+    assert "--data-file" in result.stdout
 
 
 def test_installer_refuses_to_replace_existing_path(tmp_path: Path) -> None:

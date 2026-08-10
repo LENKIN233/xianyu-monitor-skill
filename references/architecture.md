@@ -20,6 +20,10 @@ runtime and browser availability without starting Playwright or reading state.
 User, Agent Skills host, or scheduler
                  |
                  v
+           scripts/xianyu.py
+     (all routes; monitor flow below)
+                 |
+                 v
           scripts/monitor.py --------------+
                  |                         |
                  v                         v
@@ -38,9 +42,12 @@ User, Agent Skills host, or scheduler
         Host-owned delivery adapter
 ```
 
+`xianyu.py` adds no collection behavior: it selects one existing command in the
+same process and preserves its input/output, TTY, signal, and exit-code contract.
 `spider.py` is a one-shot deterministic data collector. `task_manager.py` owns
 task definitions and seen-item state. `monitor.py` joins them and returns only
-new items. The calling host owns scheduling and delivery.
+new items. The calling host owns scheduling and delivery. Direct module/script
+entrypoints remain backward compatible.
 
 The scripts do not perform purchases, seller messaging, or external
 notifications.
@@ -237,11 +244,11 @@ silently filtering or rewriting tasks.
 
 ## Host boundary
 
-The portable runtime core consists of `SKILL.md`, the read-only doctor and the
-search/state/task/monitor commands in `scripts/`, plus their API and architecture
-references. Its instruction metadata uses only standard Agent Skills frontmatter
-and skill-root-relative resources. Runtime collection uses Python, JSON,
-Playwright, a supported browser, and network access to Xianyu.
+The portable runtime core consists of `SKILL.md`, the `xianyu.py` dispatcher,
+the read-only doctor and search/state/task/monitor commands in `scripts/`, plus
+their Skill-facing references. Its instruction metadata uses only standard
+Agent Skills frontmatter and skill-root-relative resources. Runtime collection
+uses Python, JSON, Playwright, a supported browser, and network access to Xianyu.
 
 Standard and enhanced storage state use a desktop context aligned with Xianyu's
 PC search API. Enhanced snapshots may override locale and timezone, but cannot
@@ -264,13 +271,14 @@ while old Chrome activity or a debugging listener remains.
 
 Packaging and host integration remain optional:
 
-- `scripts/install_skill.py` maps one checkout to host discovery roots.
+- `scripts/xianyu.py install` maps one checkout to host discovery roots through
+  the backward-compatible `install_skill.py` module.
 - `references/host_adapters.md` owns host-specific install and schedule syntax.
 - `agents/openai.yaml` provides Codex/ChatGPT presentation metadata.
 - Codex and OpenClaw can discover the skill through `.agents/skills`.
 - Claude Code discovers the same directory through `.claude/skills`.
 - Agent schedulers and operating-system schedulers invoke the same one-shot
-  `monitor.py` command.
+  `xianyu.py monitor` workflow (or the compatible direct `monitor.py` entrypoint).
 
 `monitor.py --quiet-if-empty` is the deterministic adapter contract for
 stdout-driven schedulers. It suppresses routine scraper diagnostics throughout

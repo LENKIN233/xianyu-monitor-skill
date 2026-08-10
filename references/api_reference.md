@@ -2,6 +2,7 @@
 
 ## Contents
 
+- [xianyu.py](#xianyupy)
 - [doctor.py](#doctorpy)
 - [spider.py](#spiderpy)
 - [task_manager.py](#task_managerpy)
@@ -22,6 +23,33 @@ clients. The former `--cdp-user-data-dir` option is hidden on the search,
 monitor, and login entrypoints solely so upgrades receive the structured
 `ArgumentError` response; it never opens a connection. Run browser work on the
 trusted browser-owning host with `--browser-channel chrome` instead.
+
+## `xianyu.py`
+
+Primary workflow dispatcher:
+
+```text
+doctor    -> doctor.py
+login     -> login_state.py
+search    -> spider.py
+task      -> task_manager.py
+monitor   -> monitor.py
+install   -> install_skill.py
+```
+
+Run `python scripts/xianyu.py --help` or append `--help` after a command. The
+dispatcher imports only the selected module in the same process and forwards
+the remaining argv, stdin/TTY, cwd, stdout, stderr, `SystemExit`, and return code
+without interpreting command-specific values. It changes only the displayed
+program name so delegated help remains directly copyable. Unknown commands do
+not echo the supplied value; they return one `ArgumentError` JSON object and
+exit `2`. A `SIGTERM` received while loading a selected module still enters the
+controlled cancellation contract and exits `130`.
+
+The direct scripts remain supported for backward compatibility and advanced
+use. `create_state.py` is the credential-safe Cookie/storage-state import tool;
+`cdp_profile.py` is the guarded legacy migration cleanup. They are intentionally
+not promoted into the six-command primary workflow.
 
 ## `doctor.py`
 
@@ -528,9 +556,10 @@ two entries. The installer refuses to replace any existing unrelated path or
 silently convert an existing symlink install into copy mode. If a later target
 fails, targets created by that same invocation are rolled back.
 
-Copy mode uses a runtime allowlist and excludes repositories, virtual
-environments, test caches, and local state. The hidden `--home` option exists
-only for isolated testing and packaging. Copy and symlink installs are built
+Copy mode installs the minimal runtime, Skill-facing references/metadata, and
+license. It excludes the repository README, tests, virtual environments, caches,
+and local state/task data. The hidden `--home` option exists only for isolated
+testing and packaging. Copy and symlink installs are built
 under a private same-filesystem staging path and published with the platform's
 atomic no-replace rename. If that primitive or filesystem guarantee is
 unavailable, installation fails closed instead of using a check-then-rename
@@ -559,6 +588,9 @@ scheduler encodings cannot lose a notification; JSON parsers recover the
 original Unicode text.
 
 The supported entrypoint contracts are a script path from any working
-directory, such as `python /absolute/skill/scripts/monitor.py`, or a module from
-the skill root, such as `python -m scripts.monitor`. Agent and scheduler
-examples use script paths because they are simplest to make absolute.
+directory, such as `python /absolute/skill/scripts/xianyu.py monitor`, or a
+module from the skill root, such as `python -m scripts.xianyu monitor` and the
+legacy `python -m scripts.monitor`. Agent and scheduler examples use script
+paths because they are simplest to make absolute. Use the script-path form for
+the doctor's strict no-write guarantee; Python itself may create package
+bytecode before a `-m scripts.xianyu doctor` module begins unless `-B` is used.

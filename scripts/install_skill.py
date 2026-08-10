@@ -32,6 +32,7 @@ HOST_ROOTS = {
     "openclaw": Path(".agents/skills"),
 }
 REQUIRED_COPY_FILES = (
+    "LICENSE",
     "references/api_reference.md",
     "references/architecture.md",
     "references/host_adapters.md",
@@ -46,14 +47,10 @@ REQUIRED_COPY_FILES = (
     "scripts/monitor.py",
     "scripts/spider.py",
     "scripts/task_manager.py",
+    "scripts/xianyu.py",
     "SKILL.md",
 )
-OPTIONAL_COPY_FILES = (
-    "LICENSE",
-    "README.md",
-    "agents/openai.yaml",
-    "scripts/state_example.json",
-)
+OPTIONAL_COPY_FILES = ("agents/openai.yaml",)
 COPY_FILES = (
     *OPTIONAL_COPY_FILES,
     *REQUIRED_COPY_FILES,

@@ -36,10 +36,10 @@ git clone https://github.com/LENKIN233/xianyu-monitor-skill.git xianyu-monitor
 cd xianyu-monitor
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python scripts/doctor.py
+.venv/bin/python scripts/xianyu.py doctor
 ```
 
-`doctor.py` 只读检查 Python、依赖和可用浏览器，不启动浏览器、不写文件，也不回显
+`xianyu.py doctor` 只读检查 Python、依赖和可用浏览器，不启动浏览器、不写文件，也不回显
 本地路径。若返回 `install-browser`，再执行
 `.venv/bin/python -m playwright install chromium` 并重跑；已有本机 Chrome 时不会要求
 下载重复浏览器。`ok: false` 时按 `next_action` 修复；如果只发现本机 Chrome，后续命令
@@ -48,7 +48,7 @@ python3 -m venv .venv
 ### 2. 在专用浏览器中登录
 
 ```bash
-.venv/bin/python scripts/login_state.py \
+.venv/bin/python scripts/xianyu.py login \
   --confirm-in-browser \
   --output /absolute/private/path/xianyu-state.json
 ```
@@ -63,7 +63,7 @@ python3 -m venv .venv
 ### 3. 执行一次受控搜索
 
 ```bash
-.venv/bin/python scripts/spider.py \
+.venv/bin/python scripts/xianyu.py search \
   --keyword "iPhone 15 Pro" \
   --min-price 3500 \
   --max-price 5500 \
@@ -91,7 +91,7 @@ python3 -m venv .venv
 
 | 运行方式 | 发现目录或入口 | 调用方式 |
 |---|---|---|
-| 纯 CLI / 调度器 | 当前 checkout | 直接运行 `scripts/*.py` |
+| 纯 CLI / 调度器 | 当前 checkout | `.venv/bin/python scripts/xianyu.py COMMAND` |
 | Codex | `~/.agents/skills/xianyu-monitor` | `$xianyu-monitor` |
 | Claude Code | `~/.claude/skills/xianyu-monitor` | `/xianyu-monitor` |
 | OpenClaw | `~/.agents/skills/xianyu-monitor` | `/skill xianyu-monitor` |
@@ -99,11 +99,14 @@ python3 -m venv .venv
 先预览多宿主安装，不会写入：
 
 ```bash
-.venv/bin/python scripts/install_skill.py --host all --mode symlink --dry-run
+.venv/bin/python scripts/xianyu.py install --host all --mode symlink --dry-run
 ```
 
-确认后去掉 `--dry-run`。不支持目录软链接时使用 `--mode copy`；复制模式不会带上
-`.git`、虚拟环境、测试缓存或本地任务/登录文件，也不会覆盖已有路径。各宿主的项目级
+确认后去掉 `--dry-run`。不支持目录软链接时使用 `--mode copy`；复制模式只带运行时、
+Skill references/宿主元数据和许可证，不会带仓库 README、`.git`、虚拟环境、测试缓存或
+本地任务/登录文件，也不会覆盖已有路径。统一入口不会包装或改写各子命令的 JSON、TTY
+输入和退出码；原来的 `scripts/*.py` 入口继续兼容。Cookie 导入和旧 CDP profile 清理
+仍是 API reference 中的高级直调工具。各宿主的项目级
 安装、定时任务和注意事项见
 [references/host_adapters.md](references/host_adapters.md)。
 
@@ -113,7 +116,7 @@ Windows PowerShell 使用 `.\.venv\Scripts\python.exe` 代替
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe scripts\doctor.py
+.\.venv\Scripts\python.exe scripts\xianyu.py doctor
 ```
 
 Windows 上也只在 `next_action.code` 为 `install-browser` 时运行
@@ -126,7 +129,7 @@ Windows 上也只在 `next_action.code` 为 `install-browser` 时运行
 变化，不等于登录完成。等浏览器回到正常 Goofish 页面后，再提交最终确认：
 
 ```bash
-python scripts/login_state.py \
+.venv/bin/python scripts/xianyu.py login \
   --browser-channel chrome \
   --output "/absolute/private/path/xianyu-state.json"
 ```
@@ -141,15 +144,15 @@ python scripts/login_state.py \
 `ArgumentError` 并以状态码 `2` 失败，不会建立连接。
 
 若 Agent 沙箱不能启动浏览器，不要把 Chrome 通过 TCP 暴露给沙箱。改在浏览器所属的
-可信宿主上，用 `--browser-channel chrome` 完整执行 `login_state.py`、`spider.py` 和
-`monitor.py`，并只在该宿主的任务/调度配置中引用权限为 `0600` 的状态文件。Agent 可
+可信宿主上，用 `--browser-channel chrome` 完整执行 `xianyu.py login`、`search` 和
+`monitor`，并只在该宿主的任务/调度配置中引用权限为 `0600` 的状态文件。Agent 可
 消费命令输出的商品 JSON，但不得接收浏览器 profile 或状态内容。
 
 从支持 CDP 的旧版本升级时，先关闭旧专用 Chrome；若仍保留由旧版初始化的临时
 profile，只把 `cdp_profile.py` 用作受保护的迁移清理工具：
 
 ```bash
-python scripts/cdp_profile.py \
+.venv/bin/python scripts/cdp_profile.py \
   --directory "/absolute/private/tmp/xianyu-cdp.EXACT" \
   --cleanup
 ```
@@ -198,7 +201,7 @@ POSIX 下文件权限为 `0600`；除非明确增加 `--force`，否则不会覆
 不得推断登录、身份或搜索能力。
 
 保存 candidate 后必须立即用它执行一次真实受控搜索，并要求
-`search_capability.status: passed-for-this-run`；`login_state.py` 成功本身不完成能力
+`search_capability.status: passed-for-this-run`；`xianyu.py login` 成功本身不完成能力
 验证。搜索通过也只能证明该浏览器上下文在当次运行能够搜索，不能证明已认证或登录的
 是哪个账号。浏览器清理或本地持久化仍可能失败，因此必须分别读取 `ok` 和能力字段。
 `RGV587` 也只能证明请求被拒绝，不能证明账号身份。
@@ -211,7 +214,7 @@ Goofish HTTPS origin，第三方凭据不会进入搜索上下文。
 如果只有 Cookie Header，从标准输入安全生成：
 
 ```bash
-python scripts/create_state.py \
+.venv/bin/python scripts/create_state.py \
   --cookie-stdin \
   --output /absolute/private/path/xianyu-state.json
 ```
@@ -232,7 +235,7 @@ chmod 600 /absolute/private/path/xianyu-state.json
 ## 单次搜索
 
 ```bash
-python scripts/spider.py \
+.venv/bin/python scripts/xianyu.py search \
   --keyword "iPhone 15 Pro" \
   --min-price 3500 \
   --max-price 5500 \
@@ -278,7 +281,7 @@ python scripts/spider.py \
 创建任务：
 
 ```bash
-python scripts/task_manager.py \
+.venv/bin/python scripts/xianyu.py task \
   --data-file /absolute/private/path/tasks.json \
   create "MacBook Air M2" \
   --max-price 6000 \
@@ -291,13 +294,13 @@ python scripts/task_manager.py \
 条目损坏时整次操作失败且不重写原文件，不会静默丢弃无法识别的任务。
 浏览器通道会随任务保存；同一任务文件中的任务可以分别使用不同通道。运行时优先级为
 监控命令的 `--browser-channel` 覆盖值、任务保存值、`XIANYU_BROWSER_CHANNEL` 环境默认值，
-最后才是 Playwright 默认浏览器。只有 `doctor.py` 返回
+最后才是 Playwright 默认浏览器。只有 `xianyu.py doctor` 返回
 `ready-use-browser-channel` 时，才在创建命令末尾增加 `--browser-channel chrome`。
 
 第一次运行先建立“不通知存量商品”的基线：
 
 ```bash
-python scripts/monitor.py \
+.venv/bin/python scripts/xianyu.py monitor \
   --tasks-file /absolute/private/path/tasks.json \
   --task-id TASK_ID \
   --baseline
@@ -310,7 +313,7 @@ python scripts/monitor.py \
 之后正常运行：
 
 ```bash
-python scripts/monitor.py \
+.venv/bin/python scripts/xianyu.py monitor \
   --tasks-file /absolute/private/path/tasks.json \
   --task-id TASK_ID
 ```
@@ -318,7 +321,7 @@ python scripts/monitor.py \
 脚本只返回之前没见过的商品。对于“stdout 即通知”的纯命令调度器，可增加：
 
 ```bash
-python scripts/monitor.py \
+.venv/bin/python scripts/xianyu.py monitor \
   --tasks-file /absolute/private/path/tasks.json \
   --quiet-if-empty
 ```
@@ -349,7 +352,7 @@ at-least-once 语义进入 outbox，同时报告失败并允许后续重复；�
 `cron` 示例：
 
 ```cron
-*/30 * * * * cd /absolute/path/xianyu-monitor && /absolute/path/xianyu-monitor/.venv/bin/python scripts/monitor.py --tasks-file /absolute/private/path/tasks.json --task-id TASK_ID --state /absolute/private/path/xianyu-state.json --quiet-if-empty
+*/30 * * * * cd /absolute/path/xianyu-monitor && /absolute/path/xianyu-monitor/.venv/bin/python scripts/xianyu.py monitor --tasks-file /absolute/private/path/tasks.json --task-id TASK_ID --state /absolute/private/path/xianyu-state.json --quiet-if-empty
 ```
 
 创建任务前，需要用户明确授权这个周期任务读取指定 `tasks.json` 路径和每个确切的
@@ -392,10 +395,10 @@ Codex、Claude Code 与 OpenClaw 的 Agent 定时提示词、发现目录和 Ope
 ## 开发与验证
 
 ```bash
-python -m pip install -r requirements-dev.txt
-ruff check .
-ruff format --check .
-pytest
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/pytest
 ```
 
 自动化测试使用模拟页面和接口，不会登录闲鱼或启动真实浏览器。发布前如需账号级
