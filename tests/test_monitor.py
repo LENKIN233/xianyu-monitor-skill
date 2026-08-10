@@ -52,17 +52,76 @@ def test_monitor_persists_seen_items(tmp_path: Path, monkeypatch: Any) -> None:
     assert first[0]["identity"]["status"] == "not-evaluated"
 
 
-def test_monitor_parser_leaves_environment_channel_for_cdp_resolution(
+def test_monitor_parser_rejects_raw_cdp_without_echoing_path(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("XIANYU_BROWSER_CHANNEL", "chrome")
 
-    args = monitor.build_parser().parse_args(
-        ["--cdp-user-data-dir", "/private/profile"]
+    with pytest.raises(SystemExit) as captured:
+        monitor.build_parser().parse_args(
+            ["--cdp-user-data-dir", "/private/secret-profile"]
+        )
+
+    assert captured.value.code == 2
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert "raw TCP CDP is disabled" in payload["error"]
+    assert "secret-profile" not in output
+
+
+def test_run_tasks_rejects_programmatic_cdp_before_task_file_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = argparse.Namespace(
+        cdp_user_data_dir=str(tmp_path / "missing-profile"),
+        tasks_file=str(tmp_path / "missing-tasks.json"),
     )
 
-    assert args.browser_channel is None
-    assert args.cdp_user_data_dir == "/private/profile"
+    def unexpected_manager(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("disabled CDP must fail before task state is loaded")
+
+    monkeypatch.setattr(monitor, "TaskManager", unexpected_manager)
+
+    with pytest.raises(ValueError, match="raw TCP CDP is disabled"):
+        asyncio.run(monitor.run_tasks(args))
+
+
+def test_malformed_proxy_credentials_never_reach_output_or_task_file(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker = "PROXY_SENTINEL"
+    tasks_file = tmp_path / "tasks.json"
+    proxy_file = tmp_path / "proxy.txt"
+    task = TaskManager(str(tasks_file)).create_task("test")
+    proxy_file.write_text(
+        f"http://alice:{marker}@exa\uff0fmple.com:8080\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        monitor.main(
+            [
+                "--tasks-file",
+                str(tasks_file),
+                "--proxy-file",
+                str(proxy_file),
+            ]
+        )
+        == 2
+    )
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    stored_bytes = tasks_file.read_bytes()
+
+    assert payload["tasks"][0]["error"] == "proxy URL is invalid"
+    assert marker not in output
+    assert marker.encode() not in stored_bytes
+    stored = TaskManager(str(tasks_file)).get_task(task["id"])
+    assert stored is not None
+    assert stored["last_error"] == "proxy URL is invalid"
 
 
 def test_monitor_baseline_suppresses_existing_items(

@@ -17,11 +17,13 @@ from spider import (
     BrowserCleanupError,
     CapturedSearchResponse,
     CaptureTicket,
+    DependencyError,
     PlaywrightTimeoutError,
     SearchCancelledError,
     SearchCaptureError,
     SearchRejectedError,
     SearchResponseCollector,
+    SearchTransportError,
     SpiderError,
     StateFileError,
     StorageStateValidationError,
@@ -64,25 +66,28 @@ def test_cdp_sentinel_fixture_uses_platform_independent_lf(tmp_path: Path) -> No
     )
 
 
-def test_explicit_cdp_ignores_browser_channel_environment(
+def test_explicit_cdp_is_rejected_before_environment_resolution(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("XIANYU_BROWSER_CHANNEL", "chrome")
 
-    args = spider.build_parser().parse_args(
-        [
-            "--keyword",
-            "test",
-            "--state",
-            "/private/state.json",
-            "--cdp-user-data-dir",
-            "/private/profile",
-        ]
-    )
+    with pytest.raises(SystemExit) as captured:
+        spider.build_parser().parse_args(
+            [
+                "--keyword",
+                "test",
+                "--state",
+                "/private/state.json",
+                "--cdp-user-data-dir",
+                "/private/profile",
+            ]
+        )
 
-    assert args.browser_channel is None
-    assert _resolve_browser_channel(None, args.cdp_user_data_dir) is None
-    assert _resolve_browser_channel(None, None) == "chrome"
+    assert captured.value.code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert "raw TCP CDP is disabled" in payload["error"]
+    assert _resolve_browser_channel(None) == "chrome"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink coverage")
@@ -203,167 +208,20 @@ def test_cdp_endpoint_rejects_fifo_without_blocking(tmp_path: Path) -> None:
         _cdp_endpoint_from_user_data_dir(str(profile), timeout_seconds=0)
 
 
-def test_cdp_search_uses_state_in_new_context_and_never_launches(
+def test_cdp_search_fails_before_browser_or_state_access(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
-    profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-    _write_cdp_sentinel(profile)
-    (profile / "DevToolsActivePort").write_text(
-        "54321\n/devtools/browser/synthetic-browser-id\n",
-        encoding="utf-8",
-    )
-    state_file = tmp_path / "state.json"
-    state_file.write_text(
-        json.dumps(
-            {
-                "cookies": [
-                    {
-                        "name": "cookie2",
-                        "value": "SYNTHETIC",
-                        "domain": ".goofish.com",
-                        "path": "/",
-                    }
-                ],
-                "origins": [],
-            }
-        ),
-        encoding="utf-8",
-    )
-    events: list[Any] = []
+    def unexpected_playwright() -> None:
+        pytest.fail("disabled CDP must fail before Playwright starts")
 
-    class Page:
-        url = "https://www.goofish.com/search"
+    monkeypatch.setattr(spider, "async_playwright", unexpected_playwright)
 
-        def set_default_timeout(self, timeout: int) -> None:
-            events.append(("timeout", timeout))
-
-    class Context:
-        async def new_page(self) -> Page:
-            events.append("new-page")
-            return Page()
-
-        async def close(self) -> None:
-            events.append("context-close")
-
-    class Browser:
-        async def new_browser_cdp_session(self) -> Any:
-            class Session:
-                async def send(self, method: str) -> dict[str, Any]:
-                    assert method == "Browser.getBrowserCommandLine"
-                    return {"arguments": [f"--user-data-dir={profile}"]}
-
-                async def detach(self) -> None:
-                    events.append("session-detach")
-
-            return Session()
-
-        async def new_context(self, **kwargs: Any) -> Context:
-            events.append(("new-context", kwargs))
-            return Context()
-
-        async def close(self) -> None:
-            events.append("browser-disconnect")
-
-    class Chromium:
-        async def connect_over_cdp(self, endpoint: str, **kwargs: Any) -> Browser:
-            events.append(("connect", endpoint, kwargs))
-            return Browser()
-
-        async def launch(self, **_kwargs: Any) -> Browser:
-            raise AssertionError("CDP mode must not launch a browser")
-
-    class Playwright:
-        chromium = Chromium()
-
-        async def stop(self) -> None:
-            events.append("playwright-stop")
-
-    class Manager:
-        async def start(self) -> Playwright:
-            return Playwright()
-
-    class Collector:
-        def __init__(self, *_args: Any):
-            pass
-
-        async def install(self, _context: Context) -> None:
-            events.append("collector-installed")
-
-        def arm(self, expected_page: int) -> CaptureTicket:
-            return CaptureTicket(1, expected_page)
-
-        def disarm(self, _ticket: CaptureTicket) -> None:
-            events.append("collector-disarmed")
-
-        async def next(
-            self,
-            _ticket: CaptureTicket,
-            _timeout: int,
-        ) -> CapturedSearchResponse:
-            return CapturedSearchResponse(
-                status=200,
-                payload={"ret": ["SUCCESS::ok"], "data": {"resultList": []}},
-            )
-
-    async def navigate(*_args: Any, **_kwargs: Any) -> None:
-        events.append("navigated")
-
-    monkeypatch.setattr(spider, "async_playwright", lambda: Manager())
-    monkeypatch.setattr(spider, "SearchResponseCollector", Collector)
-    monkeypatch.setattr(spider, "_navigate_to_search", navigate)
-
-    instance = XianyuSpider(
-        state_file=str(state_file),
-        cdp_user_data_dir=str(profile),
-        verbose=False,
-    )
-    assert asyncio.run(instance.search("test", max_retries=1)) == []
-
-    connect_event = next(event for event in events if event[0] == "connect")
-    assert connect_event[1].startswith("ws://127.0.0.1:54321/devtools/browser/")
-    context_event = next(event for event in events if event[0] == "new-context")
-    assert context_event[1]["service_workers"] == "block"
-    assert context_event[1]["storage_state"]["cookies"][0]["name"] == "cookie2"
-    assert events[-3:] == [
-        "context-close",
-        "browser-disconnect",
-        "playwright-stop",
-    ]
-
-
-def test_cdp_command_line_requires_one_absolute_matching_profile(
-    tmp_path: Path,
-) -> None:
-    profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-
-    assert spider._command_line_uses_profile([f"--user-data-dir={profile}"], profile)
-    assert not spider._command_line_uses_profile(["--user-data-dir=profile"], profile)
-    assert not spider._command_line_uses_profile(
-        [f"--user-data-dir={profile}", f"--user-data-dir={profile}"],
-        profile,
-    )
-
-
-def test_cdp_search_requires_a_state_file(tmp_path: Path) -> None:
-    profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-
-    with pytest.raises(ValueError, match="requires --state"):
-        XianyuSpider(cdp_user_data_dir=str(profile))
-
-
-def test_cdp_search_rejects_state_inside_profile(tmp_path: Path) -> None:
-    profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-    _write_cdp_sentinel(profile)
-
-    with pytest.raises(ValueError, match="outside the CDP profile"):
+    with pytest.raises(ValueError, match="raw TCP CDP is disabled"):
         XianyuSpider(
-            state_file=str(profile / "state.json"),
-            cdp_user_data_dir=str(profile),
+            state_file=str(tmp_path / "missing-state.json"),
+            cdp_user_data_dir=str(tmp_path / "missing-profile"),
+            verbose=False,
         )
 
 
@@ -463,6 +321,26 @@ def test_local_filters_are_strict() -> None:
     )
 
     assert [item["id"] for item in result] == ["1"]
+
+
+@pytest.mark.parametrize("price", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["min_price", "max_price"])
+def test_search_rejects_nonfinite_prices(field: str, price: float) -> None:
+    instance = XianyuSpider()
+
+    with pytest.raises(ValueError, match=f"{field} must be finite"):
+        asyncio.run(instance.search("test", **{field: price}))
+
+
+def test_search_accepts_arbitrary_precision_integer_price(monkeypatch: Any) -> None:
+    instance = XianyuSpider()
+
+    async def empty_search(_keyword: str, _pages: int) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(instance, "_search_once", empty_search)
+
+    assert asyncio.run(instance.search("test", max_price=10**1000)) == []
 
 
 def test_parse_capture_accepts_success_and_rejects_risk_control() -> None:
@@ -596,6 +474,39 @@ def test_authenticated_socks5_proxy_is_rejected() -> None:
     }
 
 
+def test_malformed_proxy_error_never_contains_credentials() -> None:
+    marker = "PROXY_SENTINEL"
+    malformed = f"http://alice:{marker}@exa\uff0fmple.com:8080"
+
+    with pytest.raises(ValueError, match="proxy URL is invalid") as captured:
+        build_proxy_settings(malformed)
+
+    assert marker not in str(captured.value)
+    assert captured.value.__cause__ is None
+
+
+def test_malformed_proxy_credentials_never_reach_cli_output(capsys: Any) -> None:
+    marker = "PROXY_SENTINEL"
+    malformed = f"http://alice:{marker}@exa\uff0fmple.com:8080"
+
+    assert spider.main(["--keyword", "test", "--proxy", malformed]) == 2
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert payload["error"] == "proxy URL is invalid"
+    assert marker not in output
+
+
+def test_encoded_proxy_userinfo_is_rejected_before_logging() -> None:
+    marker = "PROXY_SENTINEL"
+    disguised = f"http://alice%3A{marker}%40proxy.example:8080"
+
+    with pytest.raises(ValueError, match="proxy URL is invalid") as captured:
+        build_proxy_settings(disguised)
+
+    assert marker not in str(captured.value)
+
+
 def test_proxy_credentials_are_removed_from_runtime_errors(
     monkeypatch: Any,
 ) -> None:
@@ -630,6 +541,30 @@ def test_search_capture_error_is_not_retried(monkeypatch: Any) -> None:
     assert attempts == 1
 
 
+def test_search_transport_error_is_retried(monkeypatch: Any) -> None:
+    spider_instance = XianyuSpider()
+    attempts = 0
+
+    async def fail_then_succeed(
+        _keyword: str,
+        _pages: int,
+    ) -> list[dict[str, Any]]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise SearchTransportError("failed to capture search API response")
+        return []
+
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(spider_instance, "_search_once", fail_then_succeed)
+    monkeypatch.setattr(spider.asyncio, "sleep", no_wait)
+
+    assert asyncio.run(spider_instance.search("test", max_retries=3)) == []
+    assert attempts == 2
+
+
 def test_retryable_error_with_cleanup_failure_is_terminal(
     monkeypatch: Any,
 ) -> None:
@@ -661,6 +596,45 @@ def test_retryable_error_with_cleanup_failure_is_terminal(
         "failed to stop the dedicated browser runtime",
     ]
     assert attempts == 1
+
+
+def test_browser_launch_error_is_dependency_failure_and_not_retried(
+    monkeypatch: Any,
+) -> None:
+    launches = 0
+    stops = 0
+
+    class Chromium:
+        async def launch(self, **_kwargs: Any) -> None:
+            nonlocal launches
+            launches += 1
+            raise spider.PlaywrightError(
+                'BrowserType.launch: Unsupported chromium channel "missing"'
+            )
+
+    class Playwright:
+        chromium = Chromium()
+
+        async def stop(self) -> None:
+            nonlocal stops
+            stops += 1
+
+    class Manager:
+        async def start(self) -> Playwright:
+            return Playwright()
+
+    monkeypatch.setattr(spider, "async_playwright", Manager)
+
+    with pytest.raises(DependencyError, match="unable to launch"):
+        asyncio.run(
+            XianyuSpider(browser_channel="missing").search(
+                "test",
+                max_retries=3,
+            )
+        )
+
+    assert launches == 1
+    assert stops == 1
 
 
 def test_cancelled_search_with_cleanup_failure_is_terminal(
@@ -1369,6 +1343,24 @@ def test_success_output_reports_capability_without_identity(
     assert payload["search_capability"]["status"] == "passed-for-this-run"
     assert payload["authentication"]["status"] == "not-evaluated"
     assert payload["identity"]["status"] == "not-evaluated"
+
+
+def test_cli_rejects_nonfinite_price_without_starting_browser(
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    def unexpected_playwright() -> None:
+        pytest.fail("non-finite input must fail before Playwright starts")
+
+    monkeypatch.setattr(spider, "async_playwright", unexpected_playwright)
+
+    assert spider.main(["--keyword", "test", "--min-price", "nan"]) == 2
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert payload["ok"] is False
+    assert payload["error"] == "min_price must be finite"
+    assert "NaN" not in output
 
 
 @pytest.mark.parametrize(
@@ -2180,6 +2172,7 @@ def test_search_response_capture_error_never_leaks_request_secrets() -> None:
         result = await collector.next(ticket, 100)
 
         assert result.error == "failed to capture search API response"
+        assert result.transport_error is True
         assert "QUERY_SENTINEL" not in result.error
         assert "PROXY_USER" not in result.error
         assert "PROXY_PASS" not in result.error

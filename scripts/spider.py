@@ -41,6 +41,21 @@ except ImportError:  # Keep the module importable for setup/help commands.
     PlaywrightTimeoutError = TimeoutError
     async_playwright = None
 
+if __package__:
+    from .cli_contract import (
+        RAW_CDP_DISABLED_MESSAGE,
+        JsonArgumentParser,
+        reject_raw_cdp_path,
+        sigterm_cancellable,
+    )
+else:
+    from cli_contract import (
+        RAW_CDP_DISABLED_MESSAGE,
+        JsonArgumentParser,
+        reject_raw_cdp_path,
+        sigterm_cancellable,
+    )
+
 
 BASE_URL = "https://www.goofish.com"
 SEARCH_API_HOST = "h5api.m.goofish.com"
@@ -181,25 +196,6 @@ def _windows_local_app_data() -> Path:
         ole32.CoTaskMemFree(raw_path)
         if uninitialize:
             ole32.CoUninitialize()
-
-
-def _command_line_uses_profile(arguments: Any, expected_profile: Path) -> bool:
-    """Verify Chrome reports the exact approved --user-data-dir argument."""
-
-    if not isinstance(arguments, list) or not all(
-        isinstance(argument, str) for argument in arguments
-    ):
-        return False
-    candidates: list[str] = []
-    for index, argument in enumerate(arguments):
-        if argument.startswith("--user-data-dir="):
-            candidates.append(argument.partition("=")[2])
-        elif argument == "--user-data-dir" and index + 1 < len(arguments):
-            candidates.append(arguments[index + 1])
-    if len(candidates) != 1:
-        return False
-    reported = Path(candidates[0]).expanduser()
-    return reported.is_absolute() and _same_existing_path(reported, expected_profile)
 
 
 def _windows_cdp_temp_root_aliases() -> tuple[tuple[Path, Path], ...]:
@@ -416,35 +412,6 @@ class DependencyError(SpiderError):
     """Raised when a required runtime dependency is missing."""
 
 
-class BrowserConnectionError(SpiderError):
-    """Raised when a dedicated local CDP browser cannot be reached."""
-
-
-async def _verify_async_cdp_profile(browser: Any, expected_profile: Path) -> None:
-    """Fail closed unless Chrome proves which user-data directory it uses."""
-
-    session: Any | None = None
-    try:
-        session = await browser.new_browser_cdp_session()
-        payload = await session.send("Browser.getBrowserCommandLine")
-    except PlaywrightError as exc:
-        raise BrowserConnectionError(
-            "connected Chrome could not prove its dedicated user-data directory; "
-            "restart it with --enable-automation"
-        ) from exc
-    finally:
-        if session is not None:
-            try:
-                await session.detach()
-            except PlaywrightError:
-                pass
-    arguments = payload.get("arguments") if isinstance(payload, dict) else None
-    if not _command_line_uses_profile(arguments, expected_profile):
-        raise BrowserConnectionError(
-            "connected Chrome did not use the approved dedicated user-data directory"
-        )
-
-
 class StateFileError(SpiderError):
     """Raised when a browser-state file is invalid or not accepted."""
 
@@ -467,6 +434,10 @@ class SearchRejectedError(SpiderError):
 
 class SearchCaptureError(SpiderError):
     """Raised when a page does not emit the expected search request."""
+
+
+class SearchTransportError(SpiderError):
+    """Raised when an intercepted search response fails in transport."""
 
 
 class BrowserCleanupError(SpiderError):
@@ -593,6 +564,7 @@ class CapturedSearchResponse:
     payload: dict[str, Any] | None
     error: str | None = None
     page_number: int | None = None
+    transport_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -1173,6 +1145,7 @@ class SearchResponseCollector:
                         payload=None,
                         error="failed to capture search API response",
                         page_number=page_number,
+                        transport_error=True,
                     ),
                 )
             )
@@ -1214,29 +1187,38 @@ def build_proxy_settings(proxy: str) -> dict[str, str]:
     if not raw:
         raise ValueError("proxy URL must not be empty")
     candidate = raw if "://" in raw else f"http://{raw}"
-    parsed = urlsplit(candidate)
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        _ = parsed.port
+        username = parsed.username
+        password = parsed.password
+    except (UnicodeError, ValueError):
+        # urllib includes the original netloc in some errors. That may contain
+        # proxy credentials, so never propagate or chain those exceptions.
+        raise ValueError("proxy URL is invalid") from None
     scheme = parsed.scheme.lower()
     if scheme not in {"http", "https", "socks5"}:
         raise ValueError("proxy scheme must be http, https, or socks5")
-    if not parsed.hostname:
+    if not hostname:
         raise ValueError("proxy URL must include a host")
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise ValueError("proxy URL must not include a path, query, or fragment")
-    try:
-        parsed.port
-    except ValueError as exc:
-        raise ValueError("proxy URL has an invalid port") from exc
 
-    has_credentials = parsed.username is not None or parsed.password is not None
+    has_credentials = username is not None or password is not None
     if scheme == "socks5" and has_credentials:
         raise ValueError("Playwright does not support authenticated SOCKS5 proxies")
 
     server_netloc = parsed.netloc.rsplit("@", 1)[-1]
+    if re.search(r"%(?:23|2f|3a|3f|40|5b|5d)", server_netloc, re.IGNORECASE):
+        # Encoded authority delimiters can disguise userinfo as a hostname and
+        # would otherwise be copied into routine proxy logs.
+        raise ValueError("proxy URL is invalid")
     settings = {"server": f"{scheme}://{server_netloc}"}
-    if parsed.username is not None:
-        settings["username"] = unquote(parsed.username)
-    if parsed.password is not None:
-        settings["password"] = unquote(parsed.password)
+    if username is not None:
+        settings["username"] = unquote(username)
+    if password is not None:
+        settings["password"] = unquote(password)
     return settings
 
 
@@ -1266,14 +1248,11 @@ def resolve_proxy(proxy: str | None, proxy_file: str | None = None) -> str | Non
 
 def _resolve_browser_channel(
     explicit_channel: str | None,
-    cdp_user_data_dir: str | None,
 ) -> str | None:
-    """Apply the environment default only when CDP was not selected explicitly."""
+    """Use an explicit browser channel before the environment default."""
 
     if explicit_channel:
         return explicit_channel
-    if cdp_user_data_dir:
-        return None
     configured = os.getenv("XIANYU_BROWSER_CHANNEL", "").strip()
     return configured or None
 
@@ -1502,27 +1481,12 @@ class XianyuSpider:
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         verbose: bool = True,
     ):
-        if browser_channel and cdp_user_data_dir:
-            raise ValueError(
-                "--browser-channel and --cdp-user-data-dir are mutually exclusive"
-            )
-        if cdp_user_data_dir and not state_file:
-            raise ValueError(
-                "--cdp-user-data-dir requires --state; capture candidate state first"
-            )
+        if cdp_user_data_dir:
+            raise ValueError(RAW_CDP_DISABLED_MESSAGE)
         self.state_file = state_file
         self.proxy_settings = build_proxy_settings(proxy) if proxy else None
         self.headless = headless
         self.browser_channel = browser_channel
-        self.cdp_user_data_dir = (
-            str(_private_cdp_profile_path(cdp_user_data_dir))
-            if cdp_user_data_dir
-            else None
-        )
-        if self.cdp_user_data_dir and state_file:
-            state_path = Path(state_file).expanduser().resolve(strict=False)
-            if state_path.is_relative_to(Path(self.cdp_user_data_dir)):
-                raise ValueError("--state must be outside the CDP profile")
         self.timeout_ms = timeout_ms
         self.verbose = verbose
         self.rate_limiter = RateLimiter()
@@ -1563,6 +1527,15 @@ class XianyuSpider:
             raise ValueError("pages must be at least 1")
         if max_retries < 1:
             raise ValueError("max_retries must be at least 1")
+        for label, value in (("min_price", min_price), ("max_price", max_price)):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(  # noqa: TRY004 - public input uses ValueError.
+                    f"{label} must be a number"
+                )
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{label} must be finite")
         if min_price is not None and min_price < 0:
             raise ValueError("min_price must not be negative")
         if max_price is not None and max_price < 0:
@@ -1606,7 +1579,6 @@ class XianyuSpider:
                 raise
             except (
                 BrowserCleanupError,
-                BrowserConnectionError,
                 SearchCaptureError,
                 SearchRejectedError,
                 StateFileError,
@@ -1646,10 +1618,6 @@ class XianyuSpider:
                 "python -m playwright install chromium"
             )
 
-        if self.cdp_user_data_dir and self.state_file:
-            current_state = Path(self.state_file).expanduser().resolve(strict=False)
-            if current_state.is_relative_to(Path(self.cdp_user_data_dir)):
-                raise ValueError("--state must be outside the CDP profile")
         storage_state, context_overrides, extra_headers = _load_state_file(
             self.state_file
         )
@@ -1673,43 +1641,25 @@ class XianyuSpider:
                 await _cleanup_interrupted_playwright_start(playwright_manager, exc)
                 raise
 
-            if self.cdp_user_data_dir:
-                cdp_endpoint = _cdp_endpoint_from_user_data_dir(
-                    self.cdp_user_data_dir,
-                    timeout_seconds=0,
-                )
-                try:
-                    browser = await playwright.chromium.connect_over_cdp(
-                        cdp_endpoint,
-                        timeout=min(max(self.timeout_ms, 1), 60_000),
-                    )
-                except PlaywrightError as exc:
-                    raise BrowserConnectionError(
-                        "unable to connect to the dedicated local Chrome browser"
-                    ) from exc
-                await _verify_async_cdp_profile(
-                    browser,
-                    Path(self.cdp_user_data_dir),
-                )
-                self._log("[browser] connected to dedicated local Chrome")
-            else:
-                launch_kwargs: dict[str, Any] = {"headless": self.headless}
-                if self.proxy_settings:
-                    launch_kwargs["proxy"] = self.proxy_settings
-                    self._log(f"[proxy] using {self.proxy_settings['server']}")
-                if self.browser_channel:
-                    launch_kwargs["channel"] = self.browser_channel
+            launch_kwargs: dict[str, Any] = {"headless": self.headless}
+            if self.proxy_settings:
+                launch_kwargs["proxy"] = self.proxy_settings
+                self._log(f"[proxy] using {self.proxy_settings['server']}")
+            if self.browser_channel:
+                launch_kwargs["channel"] = self.browser_channel
+            try:
                 browser = await playwright.chromium.launch(**launch_kwargs)
+            except PlaywrightError as exc:
+                raise DependencyError(
+                    "unable to launch the configured browser; install Playwright "
+                    "Chromium or choose a supported --browser-channel"
+                ) from exc
             if browser is not None:
                 context_kwargs = _context_options(
                     storage_state,
                     context_overrides,
                     extra_headers,
                 )
-                if self.cdp_user_data_dir and self.proxy_settings:
-                    context_kwargs["proxy"] = self.proxy_settings
-                    self._log(f"[proxy] using {self.proxy_settings['server']}")
-
                 context = await browser.new_context(**context_kwargs)
                 collector = SearchResponseCollector(keyword)
                 await collector.install(context)
@@ -1725,7 +1675,7 @@ class XianyuSpider:
                         search_url=search_url,
                         timeout_ms=self.timeout_ms,
                         state_supplied=storage_state is not None,
-                        headless=self.headless and not self.cdp_user_data_dir,
+                        headless=self.headless,
                     )
                     try:
                         capture = await collector.next(ticket, self.timeout_ms)
@@ -1738,7 +1688,7 @@ class XianyuSpider:
                         headed_hint = (
                             "; Xianyu may suppress search requests in headless mode; "
                             "retry once with --headed"
-                            if self.headless and not self.cdp_user_data_dir
+                            if self.headless
                             else ""
                         )
                         raise SearchCaptureError(
@@ -1766,12 +1716,12 @@ class XianyuSpider:
                         break
         finally:
             try:
-                if self.cdp_user_data_dir and context is not None:
+                if browser is not None:
                     primary_error = sys.exc_info()[1]
                     try:
-                        await context.close()
+                        await browser.close()
                     except BaseException as exc:  # noqa: BLE001
-                        message = "failed to close the isolated search context"
+                        message = "failed to close the dedicated search browser"
                         if not isinstance(exc, Exception):
                             capability_status = (
                                 search_capability_status(primary_error)
@@ -1801,80 +1751,40 @@ class XianyuSpider:
                                 search_passed=True,
                             ) from exc
             finally:
-                try:
-                    if browser is not None:
-                        primary_error = sys.exc_info()[1]
-                        try:
-                            await browser.close()
-                        except BaseException as exc:  # noqa: BLE001
-                            message = (
-                                "failed to disconnect from the connected search browser"
-                                if self.cdp_user_data_dir
-                                else "failed to close the dedicated search browser"
+                if playwright is not None:
+                    primary_error = sys.exc_info()[1]
+                    try:
+                        await playwright.stop()
+                    except BaseException as exc:  # noqa: BLE001
+                        message = "failed to stop the dedicated browser runtime"
+                        if not isinstance(exc, Exception):
+                            capability_status = (
+                                search_capability_status(primary_error)
+                                if primary_error is not None
+                                else "passed-for-this-run"
                             )
-                            if not isinstance(exc, Exception):
-                                capability_status = (
-                                    search_capability_status(primary_error)
-                                    if primary_error is not None
-                                    else "passed-for-this-run"
-                                )
-                                self.last_capability_status = capability_status
-                                setattr(exc, "capability_status", capability_status)
-                                if primary_error is not None:
-                                    for failure in getattr(
-                                        primary_error,
-                                        "cleanup_failures",
-                                        [],
-                                    ):
-                                        _append_cleanup_failure(exc, failure)
-                                    if capability_status == "passed-for-this-run":
-                                        setattr(exc, "search_passed", True)
-                                else:
-                                    setattr(exc, "search_passed", True)
-                                _append_cleanup_failure(exc, message)
-                                raise
+                            self.last_capability_status = capability_status
+                            setattr(exc, "capability_status", capability_status)
                             if primary_error is not None:
-                                _append_cleanup_failure(primary_error, message)
-                            else:
-                                raise BrowserCleanupError(
-                                    message,
-                                    search_passed=True,
-                                ) from exc
-                finally:
-                    if playwright is not None:
-                        primary_error = sys.exc_info()[1]
-                        try:
-                            await playwright.stop()
-                        except BaseException as exc:  # noqa: BLE001
-                            message = "failed to stop the dedicated browser runtime"
-                            if not isinstance(exc, Exception):
-                                capability_status = (
-                                    search_capability_status(primary_error)
-                                    if primary_error is not None
-                                    else "passed-for-this-run"
-                                )
-                                self.last_capability_status = capability_status
-                                setattr(exc, "capability_status", capability_status)
-                                if primary_error is not None:
-                                    for failure in getattr(
-                                        primary_error,
-                                        "cleanup_failures",
-                                        [],
-                                    ):
-                                        _append_cleanup_failure(exc, failure)
-                                    if capability_status == "passed-for-this-run":
-                                        setattr(exc, "search_passed", True)
-                                else:
+                                for failure in getattr(
+                                    primary_error,
+                                    "cleanup_failures",
+                                    [],
+                                ):
+                                    _append_cleanup_failure(exc, failure)
+                                if capability_status == "passed-for-this-run":
                                     setattr(exc, "search_passed", True)
-                                _append_cleanup_failure(exc, message)
-                                raise
-                            if primary_error is not None:
-                                _append_cleanup_failure(primary_error, message)
                             else:
-                                raise BrowserCleanupError(
-                                    message,
-                                    search_passed=True,
-                                ) from exc
+                                setattr(exc, "search_passed", True)
+                            _append_cleanup_failure(exc, message)
+                            raise
+                        if primary_error is not None:
+                            _append_cleanup_failure(primary_error, message)
+                        else:
+                            raise BrowserCleanupError(
+                                message,
+                                search_passed=True,
+                            ) from exc
 
         return items
 
@@ -1907,6 +1817,8 @@ class XianyuSpider:
 
     def _parse_capture(self, capture: CapturedSearchResponse) -> list[dict[str, Any]]:
         if capture.error:
+            if capture.transport_error:
+                raise SearchTransportError(capture.error)
             raise SearchCaptureError(capture.error)
         if capture.status is None or not 200 <= capture.status < 300:
             raise SearchRejectedError(
@@ -2093,6 +2005,8 @@ class XianyuSpider:
         if not match:
             return None
         value = float(match.group(0))
+        if not math.isfinite(value):
+            return None
         return int(value) if value.is_integer() else value
 
     @staticmethod
@@ -2112,7 +2026,7 @@ class XianyuSpider:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Search Xianyu and emit JSON")
+    parser = JsonArgumentParser(description="Search Xianyu and emit JSON")
     parser.add_argument("--keyword", "-k", required=True, help="search keyword")
     parser.add_argument("--max-price", type=float, help="maximum price")
     parser.add_argument("--min-price", type=float, help="minimum price")
@@ -2138,10 +2052,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     browser_group.add_argument(
         "--cdp-user-data-dir",
-        help=(
-            "connect through DevToolsActivePort in an explicitly dedicated, "
-            "private Chrome user-data directory; requires --state"
-        ),
+        type=reject_raw_cdp_path,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--headed", action="store_true", help="show the browser")
     parser.add_argument("--debug", action="store_true", help="enable debug metadata")
@@ -2152,12 +2064,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@sigterm_cancellable
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    browser_channel = _resolve_browser_channel(
-        args.browser_channel,
-        args.cdp_user_data_dir,
-    )
+    browser_channel = _resolve_browser_channel(args.browser_channel)
     spider: XianyuSpider | None = None
     try:
         spider = XianyuSpider(
@@ -2165,7 +2075,6 @@ def main(argv: list[str] | None = None) -> int:
             proxy=resolve_proxy(args.proxy, args.proxy_file),
             headless=not args.headed,
             browser_channel=browser_channel,
-            cdp_user_data_dir=args.cdp_user_data_dir,
             verbose=not args.quiet,
         )
         spider.debug = args.debug
@@ -2196,7 +2105,7 @@ def main(argv: list[str] | None = None) -> int:
                 "max_price": args.max_price,
                 "location": args.location,
             }
-        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        print(json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False))
         return 0  # noqa: TRY300 - success emission must stay cancellation-protected.
     except (KeyboardInterrupt, asyncio.CancelledError) as exc:
         capability_status = search_capability_status(exc)
@@ -2219,6 +2128,7 @@ def main(argv: list[str] | None = None) -> int:
                     "cleanup": cleanup_evidence(exc),
                 },
                 ensure_ascii=True,
+                allow_nan=False,
             )
         )
         return 130
@@ -2243,6 +2153,7 @@ def main(argv: list[str] | None = None) -> int:
                     "cleanup": cleanup_evidence(exc),
                 },
                 ensure_ascii=True,
+                allow_nan=False,
             )
         )
         return 130
@@ -2267,6 +2178,7 @@ def main(argv: list[str] | None = None) -> int:
                     "cleanup": cleanup_evidence(exc),
                 },
                 ensure_ascii=True,
+                allow_nan=False,
             )
         )
         return 2

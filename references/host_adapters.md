@@ -9,7 +9,7 @@ same Agent Skills directory and one-shot monitor command to common hosts.
 |---|---|---|
 | Codex | `~/.agents/skills/xianyu-monitor` | `$xianyu-monitor` |
 | Claude Code | `~/.claude/skills/xianyu-monitor` | `/xianyu-monitor` |
-| OpenClaw | `~/.agents/skills/xianyu-monitor` | `/xianyu-monitor` |
+| OpenClaw | `~/.agents/skills/xianyu-monitor` | `/skill xianyu-monitor` |
 | Plain CLI | Any directory | Run `scripts/*.py` |
 
 Codex and OpenClaw share the current `~/.agents/skills` convention. OpenClaw
@@ -61,6 +61,9 @@ Every scheduler should run one process and inspect its exit code. Use
 The same command can be configured in `systemd`, `launchd`, Windows Task
 Scheduler, CI, or a container scheduler. Preserve both stdout and stderr. A
 nonzero exit is failure even if no notification transport is configured.
+CLI parsing failures are JSON on stdout with exit `2`. Scheduler
+`SIGTERM` is converted to controlled cancellation, including cleanup evidence,
+and exits `130`; do not discard that final JSON.
 
 The core commits seen IDs before the host delivers stdout. It therefore
 deduplicates collection but cannot promise exactly-once external delivery. For
@@ -102,39 +105,38 @@ Do not place browser state in a repository or CI artifact.
 Inject authenticated proxies as `XIANYU_PROXY` or mount a user-private file and
 pass `--proxy-file`; never store proxy credentials in job arguments.
 
-Browser-state-backed monitoring is local by default. A cloud or sandboxed agent can
-run it only when the operator securely provisions both the task file and every
-referenced login-state file into that runtime. Never expose browser-state
-contents by committing, uploading, or embedding them in a prompt. An exact
-local path may appear only in the operator-authorized host configuration needed
-to run the command; do not publish it.
+Browser-state-backed monitoring belongs on a trusted host that can launch its
+own Playwright browser. Chrome's external TCP CDP endpoint has no client
+authentication, so do not expose a browser to a cloud or local sandbox through
+a debugging port. The hidden legacy `--cdp-user-data-dir` flag returns
+structured `ArgumentError` JSON and exit `2`; it never connects.
 
-If a local sandbox can read the approved state but cannot launch Chromium, use
-the CDP fallback only with an exact operator-approved, temporary, private Chrome
-user-data directory under an operating-system temporary root, created outside
-the sandbox. Start Chrome with a non-default
-`--user-data-dir`, `--remote-debugging-port=0`, and `--enable-automation`.
-Before Chrome starts, initialize the empty directory with
-`scripts/cdp_profile.py --directory PATH`; pass that directory through
-`--cdp-user-data-dir`. Never point it at the operator's daily/default profile.
-The login flow may use `--confirm-in-browser`; the agent must release browser
-control while the operator types the visible confirmation code. CDP search still
-requires the exact authorized `--state` path and creates a separate search
-context. The operator must privately hand over the exact absolute directory;
-shell variables do not cross into the sandbox. This bridge is available only
-when the host and sandbox share the directory, user identity, and loopback
-namespace. POSIX permissions are checked by the CLI. On Windows, use the
-`Temp` child of the LocalAppData Known Folder and restrict the directory with
-the current user's NTFS ACL before use because the CLI cannot verify that ACL.
-Close the dedicated Chrome and remove only that exact temporary profile after
-the run.
-Use `scripts/cdp_profile.py --directory PATH --cleanup` only after the operator
-closes that dedicated Chrome. The guarded cleanup refuses a non-temporary or
-uninitialized directory, Chrome activity indicators, and a listening debugging
-endpoint. Keep close and cleanup strictly serial; never relaunch that profile
-concurrently. On a platform without symlink-safe recursive removal, cleanup
-fails closed and the operator must move only that exact directory through the
-operating-system file manager. Do not replace it with a broad recursive delete.
+When a sandbox cannot launch Chromium, run the complete `login_state.py`,
+`spider.py`, and `monitor.py` workflow on the browser-owning host with
+`--browser-channel chrome`. Keep the exact login-state file there with POSIX
+`0600` permissions (or a current-user-only Windows ACL), and configure only its
+path in that trusted host's task or scheduler. The sandboxed agent may receive
+sanitized listing JSON, never the state contents or a browser profile.
+
+Before scheduling a newly captured state, let the user use the 1800-second
+default login window. A scanned or disappearing QR is not completion; the user
+may still need to approve login on the phone and must wait for a normal Goofish
+page before final confirmation. Only after that confirmation may the command
+spend up to 15 seconds observing the optional navigation display-name signal.
+Absence or an ordinary probe failure reports `not-observed`; cancellation and
+cleanup failures remain terminal. Whether it reports `present` or
+`not-observed`, the saved state remains only a
+candidate and authentication/identity are not established. Run a real search
+on the trusted host and require
+`search_capability.status: passed-for-this-run` before enabling the schedule;
+never describe that result as authenticated or identity-verified.
+
+After upgrading from a CDP-capable release, close any legacy dedicated Chrome
+and use `scripts/cdp_profile.py --directory PATH --cleanup` only to remove its
+old initialized temporary profile. This command no longer initializes profiles
+and requires `--cleanup`; it rejects activity indicators, a still-listening old
+debugging endpoint, symlink risks, and unsafe recursive removal. Keep close and
+cleanup serial, and never replace it with a broad recursive delete.
 
 ## Codex
 
@@ -202,6 +204,11 @@ OpenClaw releases. Verify discovery with:
 openclaw skills list
 ```
 
+For an explicit chat invocation, use the portable form
+`/skill xianyu-monitor [input]`. OpenClaw may also display a native shortcut
+whose command name it has normalized for the active runtime and channel; use
+that displayed name if desired, and do not assume `/xianyu-monitor` exists.
+
 Also run `openclaw cron --help` on the target host before creating a job; the
 examples below follow the current CLI, but a different installed release may
 expose a different command surface.
@@ -228,9 +235,11 @@ openclaw cron create "0 */2 * * *" \
 ```
 
 Do not use lightweight context for an isolated job that relies on skill
-discovery. If that agent is sandboxed, mount the skill runtime and login-state
-file read-only, but give the task file's parent directory write access for
-locks, atomic replacement, and seen-item persistence. OpenClaw's `{baseDir}`,
+discovery. If that agent cannot launch a Playwright browser, run the complete
+monitor command on a trusted browser-owning host and send the agent only its
+listing JSON; do not mount the login-state file into that sandbox. Give the
+trusted command's task-file parent write access for locks, atomic replacement,
+and seen-item persistence. OpenClaw's `{baseDir}`,
 `metadata.openclaw`, `NO_REPLY`, delivery flags, and cron syntax are adapter
 details and must remain outside the portable core workflow.
 
@@ -239,4 +248,6 @@ details and must remain outside the portable core workflow.
 A symlink install tracks the checkout; update it with `git pull`, then reinstall
 runtime dependencies if `requirements.txt` changed. A copy install is a
 snapshot. Install a new copy into a clean target after reviewing changes rather
-than overwriting an unknown directory.
+than overwriting an unknown directory. Before deleting an old checkout, close
+any legacy CDP Chrome and use the guarded cleanup command above for each exact
+old initialized temporary profile.

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -20,8 +18,17 @@ SYMLINK_SAFE_RMTREE = bool(
 )
 
 
+def _initialize_legacy_profile(profile: Path) -> Path:
+    profile.mkdir(mode=0o700, exist_ok=True)
+    profile.chmod(0o700)
+    sentinel = profile / CDP_PROFILE_SENTINEL_NAME
+    sentinel.write_text(CDP_PROFILE_SENTINEL_VALUE, encoding="utf-8", newline="\n")
+    sentinel.chmod(0o600)
+    return profile
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS temp-root alias")
-def test_initialize_accepts_standard_macos_temp_root_alias() -> None:
+def test_legacy_cleanup_accepts_standard_macos_temp_root_alias() -> None:
     profile = Path(tempfile.mkdtemp(prefix="xianyu-cdp-alias-test."))
     profile.chmod(0o700)
     if profile.absolute() == profile.resolve():
@@ -29,9 +36,8 @@ def test_initialize_accepts_standard_macos_temp_root_alias() -> None:
         pytest.skip("the configured macOS temp root has no lexical alias")
 
     try:
-        resolved = cdp_profile.initialize_cdp_profile(str(profile))
+        _initialize_legacy_profile(profile)
 
-        assert resolved.samefile(profile)
         assert _private_cdp_profile_path(str(profile)).samefile(profile)
     finally:
         sentinel = profile / CDP_PROFILE_SENTINEL_NAME
@@ -41,46 +47,30 @@ def test_initialize_accepts_standard_macos_temp_root_alias() -> None:
             profile.rmdir()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX permission coverage")
-def test_initialize_cdp_profile_creates_private_required_sentinel(
-    tmp_path: Path,
-) -> None:
-    profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-
-    assert cdp_profile.initialize_cdp_profile(str(profile)) == profile
-    sentinel = profile / CDP_PROFILE_SENTINEL_NAME
-    assert sentinel.read_text(encoding="utf-8") == CDP_PROFILE_SENTINEL_VALUE
-    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o600
-    assert _private_cdp_profile_path(str(profile)) == profile
-
-    with pytest.raises(ValueError, match="empty"):
-        cdp_profile.initialize_cdp_profile(str(profile))
-
-
-def test_cdp_profile_main_does_not_echo_private_path(
+def test_cdp_profile_main_rejects_legacy_initialization_without_echoing_path(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     profile = tmp_path / "private-profile-name"
     profile.mkdir(mode=0o700)
 
-    assert cdp_profile.main(["--directory", str(profile)]) == 0
+    with pytest.raises(SystemExit) as captured:
+        cdp_profile.main(["--directory", str(profile)])
     output = capsys.readouterr().out
 
+    assert captured.value.code == 2
     assert "private-profile-name" not in output
-    assert json.loads(output) == {
-        "ok": True,
-        "profile": {"status": "initialized-empty-private"},
-        "cleanup": {"status": "complete-or-not-required"},
-    }
+    payload = json.loads(output)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "ArgumentError"
+    assert "--cleanup" in payload["error"]
+    assert list(profile.iterdir()) == []
 
 
 @pytest.mark.skipif(not SYMLINK_SAFE_RMTREE, reason="guarded cleanup unavailable")
 def test_cleanup_removes_only_initialized_stopped_profile(tmp_path: Path) -> None:
     profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-    cdp_profile.initialize_cdp_profile(str(profile))
+    _initialize_legacy_profile(profile)
     (profile / "synthetic-data").write_text("safe fixture", encoding="utf-8")
 
     cdp_profile.cleanup_cdp_profile(str(profile))
@@ -94,8 +84,7 @@ def test_cleanup_refuses_profile_with_chrome_activity_indicator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-    cdp_profile.initialize_cdp_profile(str(profile))
+    _initialize_legacy_profile(profile)
     (profile / "SingletonLock").write_text("synthetic", encoding="utf-8")
 
     def unexpected_rename(*_args: object, **_kwargs: object) -> None:
@@ -116,8 +105,7 @@ def test_cleanup_restores_profile_when_rename_is_interrupted(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-    cdp_profile.initialize_cdp_profile(str(profile))
+    _initialize_legacy_profile(profile)
     original_rename = Path.rename
     interrupted = False
 
@@ -145,8 +133,7 @@ def test_stopped_check_refuses_listening_debug_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-    cdp_profile.initialize_cdp_profile(str(profile))
+    _initialize_legacy_profile(profile)
     (profile / "DevToolsActivePort").write_text(
         "54321\n/devtools/browser/synthetic\n",
         encoding="utf-8",
@@ -175,8 +162,7 @@ def test_stopped_check_accepts_refused_stale_debug_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-    cdp_profile.initialize_cdp_profile(str(profile))
+    _initialize_legacy_profile(profile)
     (profile / "DevToolsActivePort").write_text(
         "54321\n/devtools/browser/synthetic\n",
         encoding="utf-8",
@@ -197,8 +183,7 @@ def test_partial_cleanup_reports_unknown_and_failed_without_echoing_path(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     profile = tmp_path / "private-profile-name"
-    profile.mkdir(mode=0o700)
-    cdp_profile.initialize_cdp_profile(str(profile))
+    _initialize_legacy_profile(profile)
     (profile / "synthetic-data").write_text("safe fixture", encoding="utf-8")
 
     def fail_after_partial_remove(path: Path) -> None:

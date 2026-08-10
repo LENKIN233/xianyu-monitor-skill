@@ -98,7 +98,11 @@ python scripts/install_skill.py --host all --mode symlink
 |---|---|---|
 | Codex | `~/.agents/skills/xianyu-monitor` | `$xianyu-monitor` |
 | Claude Code | `~/.claude/skills/xianyu-monitor` | `/xianyu-monitor` |
-| OpenClaw | `~/.agents/skills/xianyu-monitor` | `/xianyu-monitor` |
+| OpenClaw | `~/.agents/skills/xianyu-monitor` | `/skill xianyu-monitor` |
+
+OpenClaw 中可移植的显式调用是 `/skill xianyu-monitor`。运行时可能另外展示一个
+经过规范化的原生快捷命令；其确切名称由当前版本决定，不要假定它一定是
+`/xianyu-monitor`。
 
 当前 [Codex](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills)
 与 [OpenClaw](https://docs.openclaw.ai/skills) 官方文档都列出
@@ -116,7 +120,8 @@ check-then-rename。
 ## 浏览器状态
 
 推荐使用内置登录命令。它会打开独立的可见浏览器，扫码、验证码和 CAPTCHA 必须由
-用户本人完成；随后还必须打开账号区域，亲眼核对是预期账号：
+用户本人完成。扫码后通常还要在手机上点击确认登录；二维码消失只表示扫码流程发生了
+变化，不等于登录完成。等浏览器回到正常 Goofish 页面后，再提交最终确认：
 
 ```bash
 python scripts/login_state.py \
@@ -125,51 +130,21 @@ python scripts/login_state.py \
 ```
 
 `--browser-channel chrome` 只选择 Chrome 可执行文件，不会复用已经打开的普通 Chrome
-会话或 profile；必须在命令新开的窗口里重新登录。
+会话或 profile；必须在命令新开的窗口里重新登录。默认登录等待窗口为 1800 秒，
+可用 `--timeout` 显式调整。
 
-若 Agent 沙箱无法启动 Chrome，可由用户在普通 Terminal 外部启动一个全新、临时、
-仅用于闲鱼的私有 profile。不要使用日常 Chrome 的默认数据目录：
+本项目不再连接外部 Chrome 的 TCP 调试端口。Chrome 的本机 TCP CDP 没有客户端认证；
+同一网络命名空间中的其他本地进程可能发现端口并接管登录上下文。旧版
+`--cdp-user-data-dir` 参数仅为兼容升级而隐藏保留，传入时会在 stdout 返回结构化
+`ArgumentError` 并以状态码 `2` 失败，不会建立连接。
 
-```bash
-# macOS Terminal
-cdp_profile="$(mktemp -d /private/tmp/xianyu-cdp.XXXXXX)"
-chmod 700 "$cdp_profile"
-python scripts/cdp_profile.py --directory "$cdp_profile"
-open -na "Google Chrome" --args \
-  --user-data-dir="$cdp_profile" \
-  --remote-debugging-port=0 \
-  --enable-automation \
-  --no-first-run \
-  --no-default-browser-check \
-  "https://www.goofish.com/"
-```
+若 Agent 沙箱不能启动浏览器，不要把 Chrome 通过 TCP 暴露给沙箱。改在浏览器所属的
+可信宿主上，用 `--browser-channel chrome` 完整执行 `login_state.py`、`spider.py` 和
+`monitor.py`，并只在该宿主的任务/调度配置中引用权限为 `0600` 的状态文件。Agent 可
+消费命令输出的商品 JSON，但不得接收浏览器 profile 或状态内容。
 
-随后把这个精确目录传给受限环境中的登录命令：
-
-```bash
-python scripts/login_state.py \
-  --cdp-user-data-dir "/absolute/private/tmp/xianyu-cdp.EXACT" \
-  --confirm-in-browser \
-  --output "/absolute/private/path/xianyu-state.json"
-```
-
-初始化命令只接受操作系统临时目录下的空目录，并在 Chrome 启动前写入专用 profile
-哨兵。登录和搜索命令
-连接前只读取该哨兵与 Chrome 生成的 `DevToolsActivePort`，只连接本机 loopback；已知
-默认 Chrome 目录及用户控制的中间/最终符号链接会被拒绝；只允许 macOS
-`/var` 到 `/private/var` 这类操作系统临时根标准别名。连接后还会通过 CDP 读取
-Chrome 自报的启动参数，
-在 Playwright 建立连接后立即核对精确的 `--user-data-dir`，并且在本 Skill 读取默认
-context 存储或创建搜索 context 前完成；连接传输本身可能枚举 target 元数据，因此该
-profile 路径仍属于敏感授权范围。启动时必须保留 `--enable-automation`。POSIX 下还会
-验证当前用户所有及 `0700` 等价
-的私有权限。Windows 下 CLI 无法验证 NTFS ACL，必须先由用户把该专用目录限制为仅
-本人可访问。外部 Terminal 的 `$cdp_profile` 变量不会自动进入 Agent 沙箱，必须私下
-传递其精确绝对路径；两边还必须共享该文件路径、用户身份和本机 loopback 网络。
-Agent 必须交还浏览器控制，由用户
-本人在闲鱼页登录、核对账号，并在本地确认页输入可见的一次性确认码。Agent 不得读取、
-填写或点击该确认页。状态搜索验证结束后，先关闭这一个专用 Chrome，再只清理它对应的
-精确临时目录：
+从支持 CDP 的旧版本升级时，先关闭旧专用 Chrome；若仍保留由旧版初始化的临时
+profile，只把 `cdp_profile.py` 用作受保护的迁移清理工具：
 
 ```bash
 python scripts/cdp_profile.py \
@@ -177,42 +152,23 @@ python scripts/cdp_profile.py \
   --cleanup
 ```
 
-清理命令会拒绝未初始化/非临时目录、检测到的 Chrome 活动锁、仍在监听的调试端口，
-以及不支持抗符号链接递归删除的平台。并发启动无法安全支持：必须严格串行执行
-“关闭 Chrome → 清理”，清理期间绝不能用该 profile 重启 Chrome。若平台不支持自动
-清理，由用户在系统文件管理器中只把该精确目录移入废纸篓/回收站。不要用宽泛的递归
-删除命令代替。
-
-上述启动片段适用于 macOS。Windows PowerShell 使用系统 Known Folder API 返回的
-`LocalApplicationData` 下的 `Temp` 目录，并用当前用户 NTFS ACL 限制访问，再初始化
-并启动 Chrome（Chrome 路径按实际安装位置调整）：
-
-```powershell
-$localAppData = [Environment]::GetFolderPath(
-  [Environment+SpecialFolder]::LocalApplicationData
-)
-$tempRoot = Join-Path $localAppData "Temp"
-$cdpProfile = Join-Path $tempRoot ("xianyu-cdp." + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $cdpProfile | Out-Null
-$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-icacls $cdpProfile /inheritance:r /grant:r "${currentUser}:(OI)(CI)F" | Out-Null
-python scripts/cdp_profile.py --directory $cdpProfile
-& "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" `
-  "--user-data-dir=$cdpProfile" --remote-debugging-port=0 `
-  --enable-automation --no-first-run --no-default-browser-check `
-  "https://www.goofish.com/"
-```
+该命令不再初始化 profile，且 `--cleanup` 必填。它只删除带旧版哨兵的精确临时目录，
+并会拒绝活动中的 Chrome、仍监听的旧调试端口、符号链接风险或无法安全递归删除的
+平台。严格按“关闭 Chrome → 清理”串行执行；失败时只在系统文件管理器中处理这一个
+精确目录，禁止用宽泛递归删除命令替代。
 
 默认模式会在交互终端显示一次性 `SAVE-...` 确认词。Agent 必须暂停并等待用户本人
 输入，不得代输、管道注入、猜测或复用；此模式下非交互输入、EOF 或错误确认词都会
-失败。`--confirm-in-browser` 把同样的明确确认移到上述本地确认页，是唯一允许命令使用
-非交互输入的模式。仍在登录/验证/风控页面、未观察到导航响应的展示名字段，或没有
-保留下来的 Goofish 浏览器存储材料时，两种模式都不会保存文件。
+失败。`--confirm-in-browser` 把同样的明确确认移到命令打开的本地确认页，是唯一允许命令使用
+非交互输入的模式。
 
-确认后，命令会新开一个验证页，检查当前 PC 导航响应是否含非空展示名。闲鱼当前布局
-把它当作候选会话信号，但这是未公开承诺的候选信号，不是身份凭据。命令只在内存中判断
-展示名，不会单独输出或复制该字段。保存前会删除所有非 Goofish 域的 Cookie 和
-origin；剩余的站点状态仍是账号凭证，也可能编码账号数据，禁止查看、摘要或分享。
+保存 candidate 的必要条件只有：收到用户最终确认、原页面是正常的 HTTPS Goofish 页面
+而非登录/验证/风控页，以及过滤后的 Goofish 站点状态非空。只有最终确认提交后，命令
+才会新开验证页，用最多 15 秒 best-effort 观察 PC 导航响应中的非空 `displayName`。
+这个可选信号缺失或探测页发生普通错误时不会丢弃 candidate，而是记录为
+`not-observed`；取消与清理失败仍会终止。该信号既不是认证证明，也不是身份凭据，
+命令不会输出其值。保存前会删除所有非 Goofish 域的 Cookie 和 origin；剩余的站点状态仍是
+账号凭证，也可能编码账号数据，禁止查看、摘要或分享。
 POSIX 下文件权限为 `0600`；除非明确增加 `--force`，否则不会覆盖已有文件。输出中
 的证据维度相互独立：
 
@@ -226,8 +182,11 @@ POSIX 下文件权限为 `0600`；除非明确增加 `--force`，否则不会覆
 - `confirmation.channel`：`terminal` 或 `browser`；两者都不能证明实际确认者身份；
 - `session.nav_display_name: present`：当前 Goofish PC 导航响应含非空展示名，
   但它不能证明具体账号身份；
+- `session.nav_display_name: not-observed`：15 秒 best-effort 观察未获得该可选信号；
+  candidate 仍可保存；
 - `authentication.status: not-established`：程序没有证明该候选状态已认证；
-- `identity.status: not-machine-verified`：程序没有机器验证具体账号身份；
+- `identity.status: not-machine-verified`：仅在观察到可选展示名时表示程序仍不能机器验证
+  具体账号；信号缺失时为 `not-established`；
 - `search_capability.status: not-tested`：尚未搜索。
 - `cleanup.status`：`failed` 会列出通用清理错误，提示专用浏览器可能未完全退出；
   否则为 `complete-or-not-required`。
@@ -236,9 +195,11 @@ POSIX 下文件权限为 `0600`；除非明确增加 `--force`，否则不会覆
 确认，或 Agent 曾经代输确认词，必须把输出和由此产生的文件视为异常：不得使用，也
 不得推断登录、身份或搜索能力。
 
-之后一次成功的受控搜索，只能证明该浏览器上下文在当次运行能够搜索，不能证明登录
-的是哪个账号。搜索成功后，浏览器清理或本地持久化仍可能失败，因此必须分别读取
-`ok` 和能力字段。`RGV587` 也只能证明请求被拒绝，不能证明账号身份。
+保存 candidate 后必须立即用它执行一次真实受控搜索，并要求
+`search_capability.status: passed-for-this-run`；`login_state.py` 成功本身不完成能力
+验证。搜索通过也只能证明该浏览器上下文在当次运行能够搜索，不能证明已认证或登录的
+是哪个账号。浏览器清理或本地持久化仍可能失败，因此必须分别读取 `ok` 和能力字段。
+`RGV587` 也只能证明请求被拒绝，不能证明账号身份。
 
 项目兼容其他浏览器工具导出的 Playwright storage state，以及原
 `ai-goofish-monitor` 扩展的标准和增强快照；导入文件不自带用户确认记录。无论
@@ -278,10 +239,6 @@ python scripts/spider.py \
   --state /absolute/private/path/xianyu-state.json
 ```
 
-若同一沙箱也无法启动搜索浏览器，可保持上述专用 Chrome 开启，并给搜索命令追加
-`--cdp-user-data-dir "/absolute/private/tmp/xianyu-cdp.EXACT"`。CDP 搜索仍强制要求显式 `--state`，不会把连接的
-profile 当成隐式授权或直接凭据来源。
-
 成功输出：
 
 ```json
@@ -306,6 +263,13 @@ profile 当成隐式授权或直接凭据来源。
 `RGV587` 等风控错误时立即停止；不要尝试绕过登录挑战、CAPTCHA 或风控。
 如果已提供的候选状态进入 `/search`，但无头模式没有观察到搜索接口，只使用
 `--headed` 重试一次；不要循环尝试或加入反检测绕过。
+拦截请求的临时传输故障使用 `SearchTransportError`，会遵守 `--retries`；已收到但
+畸形/不匹配的响应使用 `SearchCaptureError`，不会自动重试。
+
+所有公开 CLI 的命令行解析失败（如缺少参数或类型错误）都会在 stdout 输出一条
+`ArgumentError` JSON 并退出 `2`；`SIGTERM` 会进入与用户取消相同的受控清理路径，
+输出取消 JSON 并退出 `130`。
+价格必须是有限数值，`NaN` 和正负无穷都会被拒绝。
 
 ## 持久监控
 
@@ -320,6 +284,9 @@ python scripts/task_manager.py \
   --pages 2 \
   --state /absolute/private/path/xianyu-state.json
 ```
+
+任务文件按完整 schema 加载：字段类型、ID 唯一性、列表上限和有限价格都会验证。任一
+条目损坏时整次操作失败且不重写原文件，不会静默丢弃无法识别的任务。
 
 第一次运行先建立“不通知存量商品”的基线：
 
@@ -401,8 +368,8 @@ pytest
 smoke test，必须由用户本人在本机可见浏览器中登录并输入一次性确认词；不要把凭据
 加入测试夹具或 CI。
 
-离线测试同时覆盖非 TTY fail-closed、浏览器确认、专用 CDP profile 校验和 CDP
-搜索连接；这些用例只使用合成状态，不读取真实 profile 或网络。
+离线测试同时覆盖非 TTY fail-closed、浏览器确认、旧 raw-CDP 参数拒绝和旧 profile
+迁移清理；这些用例只使用合成状态，不读取真实 profile 或网络。
 
 ## 安全说明
 
@@ -411,9 +378,10 @@ smoke test，必须由用户本人在本机可见浏览器中登录并输入一�
   根目录 `private/`，不要依赖自定义文件名恰好被忽略。
 - 登录命令只在 stdout 输出一个最终 JSON；`browser-opening` 和可选的
   `browser-confirmation-ready` 进度写入 stderr。
-- 登录命令不会在 JSON 或进度中回显私有状态/CDP profile 路径；即便如此，也不要把
+- 登录命令不会在 JSON 或进度中回显私有状态路径；即便如此，也不要把
   本地登录日志上传到 CI、工单或公共聊天。
 - 建议监控间隔不少于 30 分钟。
+- `SearchTransportError` 是可重试的临时传输错误，重试次数由 `--retries` 限制。
 - 遇到 `SearchCaptureError` 不会自动重试；候选状态已进入搜索页时最多手动执行
   一次 `--headed`。
 - 遇到 `SearchRejectedError` 应停止重试并报告；`RGV587` 时让请求/会话冷却，
