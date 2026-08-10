@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -68,7 +69,7 @@ raise SystemExit(main())
     result = subprocess.run(  # noqa: S603
         [sys.executable, "-c", code],
         cwd=tmp_path,
-        env={"PYTHONPATH": str(ROOT / "scripts")},
+        env={**os.environ, "PYTHONPATH": str(ROOT / "scripts")},
         capture_output=True,
         text=True,
         timeout=10,
@@ -99,7 +100,7 @@ raise SystemExit(main())
     result = subprocess.run(  # noqa: S603
         [sys.executable, "-c", code],
         cwd=tmp_path,
-        env={"PYTHONPATH": str(ROOT / "scripts")},
+        env={**os.environ, "PYTHONPATH": str(ROOT / "scripts")},
         capture_output=True,
         text=True,
         timeout=10,
