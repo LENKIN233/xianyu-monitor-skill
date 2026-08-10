@@ -606,6 +606,10 @@ class TaskManager:
         normalized.setdefault("pages", 1)
         normalized.setdefault("retries", 3)
         normalized.setdefault("state_file", None)
+        normalized.setdefault("browser_channel", None)
+        browser_channel = normalized["browser_channel"]
+        if isinstance(browser_channel, str):
+            normalized["browser_channel"] = browser_channel.strip() or None
         state_file = normalized["state_file"]
         if state_file:
             state_path = Path(str(state_file)).expanduser()
@@ -644,6 +648,11 @@ class TaskManager:
         state_file = task.get("state_file")
         if state_file is not None and not isinstance(state_file, str):
             raise self._schema_error(f"{location}.state_file must be a string or null")
+        browser_channel = task.get("browser_channel")
+        if browser_channel is not None and not isinstance(browser_channel, str):
+            raise self._schema_error(
+                f"{location}.browser_channel must be a string or null"
+            )
 
         normalized = self._normalize_task(task)
 
@@ -658,7 +667,13 @@ class TaskManager:
             if not isinstance(normalized[field_name], str):
                 raise self._schema_error(f"{location}.{field_name} must be a string")
 
-        for field_name in ("location", "state_file", "last_run", "last_error"):
+        for field_name in (
+            "location",
+            "state_file",
+            "browser_channel",
+            "last_run",
+            "last_error",
+        ):
             value = normalized[field_name]
             if value is not None and not isinstance(value, str):
                 raise self._schema_error(
@@ -979,6 +994,7 @@ class TaskManager:
         pages: int,
         retries: int,
         state_file: str | None,
+        browser_channel: str | None,
     ) -> dict[str, Any] | None:
         for task in self.tasks:
             if (
@@ -990,6 +1006,7 @@ class TaskManager:
                 and int(task.get("pages", 1)) == pages
                 and int(task.get("retries", 3)) == retries
                 and task.get("state_file") == state_file
+                and task.get("browser_channel") == browser_channel
                 and task.get("status") == "running"
             ):
                 return task
@@ -1007,6 +1024,7 @@ class TaskManager:
         pages: int = 1,
         retries: int = 3,
         state_file: str | None = None,
+        browser_channel: str | None = None,
         progress: TaskMutationProgress | None = None,
     ) -> dict[str, Any]:
         keyword = keyword.strip()
@@ -1018,6 +1036,9 @@ class TaskManager:
         if retries < 1:
             raise ValueError("retries must be at least 1")
         state_file = self._resolve_state_file(state_file)
+        if browser_channel is not None and not isinstance(browser_channel, str):
+            raise ValueError("browser channel must be a string or null")
+        browser_channel = browser_channel.strip() or None if browser_channel else None
         operation_progress = (
             progress if progress is not None else TaskMutationProgress()
         )
@@ -1039,6 +1060,7 @@ class TaskManager:
                     pages,
                     retries,
                     state_file,
+                    browser_channel,
                 )
                 if existing:
                     result = copy.deepcopy(existing)
@@ -1056,6 +1078,7 @@ class TaskManager:
                         "pages": pages,
                         "retries": retries,
                         "state_file": state_file,
+                        "browser_channel": browser_channel,
                         "status": "running",
                         "created_at": timestamp,
                         "updated_at": timestamp,
@@ -1239,6 +1262,10 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--pages", type=int, default=1)
     create.add_argument("--retries", type=int, default=3)
     create.add_argument("--state")
+    create.add_argument(
+        "--browser-channel",
+        help="Playwright browser executable channel; does not reuse a profile",
+    )
     create.add_argument("--allow-duplicate", action="store_true")
 
     list_parser = subparsers.add_parser("list")
@@ -1321,6 +1348,7 @@ def main(argv: list[str] | None = None) -> int:
                 pages=args.pages,
                 retries=args.retries,
                 state_file=args.state,
+                browser_channel=args.browser_channel,
                 skip_duplicate=not args.allow_duplicate,
                 progress=mutation_progress,
             )

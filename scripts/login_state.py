@@ -74,6 +74,8 @@ SIGNED_IN_NAV_HOST = "h5api.m.goofish.com"
 SIGNED_IN_NAV_PATH = "/h5/mtop.idle.web.user.page.nav/1.0/"
 NON_IDENTITY_DISPLAY_NAMES = {"login", "sign in", "登录", "请登录", "未登录"}
 BLOCKED_PAGE_MARKERS = ("captcha", "challenge", "login", "passport", "punish", "verify")
+BROWSER_COMPLETION_DISPLAY_MS = 5_000
+BROWSER_FAILURE_DISPLAY_MS = 3_000
 
 
 @dataclass
@@ -90,6 +92,98 @@ class CaptureProgress:
 
 class BrowserCleanupError(RuntimeError):
     """Raised when a dedicated browser resource cannot be closed."""
+
+
+class LoginArgumentParser(JsonArgumentParser):
+    """Include the login command's terminal outcome in parse failures."""
+
+    def error(self, message: str) -> None:
+        safe_message = (
+            RAW_CDP_DISABLED_MESSAGE
+            if RAW_CDP_DISABLED_MESSAGE in message
+            else "invalid login arguments; run --help"
+        )
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "exit_reason": "failed",
+                    "error": safe_message,
+                    "error_type": "ArgumentError",
+                },
+                ensure_ascii=True,
+            )
+        )
+        raise SystemExit(2)
+
+
+@dataclass
+class _BrowserConfirmationSession:
+    """Keep the local confirmation page visible through the save outcome."""
+
+    page: Any
+    error_stream: TextIO
+    closed: bool = False
+
+    def _show_stage(self, stage: str, dwell_ms: int) -> None:
+        try:
+            if self.closed or self.page.is_closed():
+                return
+            if self.page.url != "about:blank":
+                return
+            self.page.bring_to_front()
+            self.page.evaluate(
+                "stage => window.__xianyuCaptureStage(stage)",
+                stage,
+            )
+            self.page.wait_for_timeout(dwell_ms)
+        except PlaywrightError:
+            # The state outcome remains authoritative if the user has already
+            # closed the purely informational local page.
+            return
+
+    def show_saved(self) -> None:
+        print(
+            json.dumps(
+                {
+                    "status": "browser-confirmation-complete",
+                    "state": "candidate-saved",
+                    "browser_close": "scheduled-after-display",
+                },
+                ensure_ascii=True,
+            ),
+            file=self.error_stream,
+            flush=True,
+        )
+        self._show_stage("saved", BROWSER_COMPLETION_DISPLAY_MS)
+
+    def show_failed(self) -> None:
+        self._show_stage("failed", BROWSER_FAILURE_DISPLAY_MS)
+
+    def show_saved_with_warning(self) -> None:
+        print(
+            json.dumps(
+                {
+                    "status": "browser-confirmation-warning",
+                    "state": "candidate-saved",
+                    "command_outcome": "failed-after-save",
+                },
+                ensure_ascii=True,
+            ),
+            file=self.error_stream,
+            flush=True,
+        )
+        self._show_stage("saved-warning", BROWSER_FAILURE_DISPLAY_MS)
+
+    def close(self, progress: CaptureProgress) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        _cleanup_preserving_primary_error(
+            self.page.close,
+            "failed to close the browser confirmation page",
+            progress,
+        )
 
 
 def _new_confirmation_token() -> str:
@@ -348,7 +442,11 @@ def _browser_confirmation_document(token: str, binding_name: str) -> str:
               cursor: pointer; }}
     .note {{ color: #57606a; line-height: 1.6; }}
     #error {{ color: #b42318; }}
-    #confirmed {{ color: #16794b; font-weight: 700; }}
+    #status[data-stage="waiting"] {{ color: #57606a; }}
+    #status[data-stage="saving"] {{ color: #8a5700; font-weight: 700; }}
+    #status[data-stage="saved"] {{ color: #16794b; font-weight: 700; }}
+    #status[data-stage="saved-warning"] {{ color: #8a5700; font-weight: 700; }}
+    #status[data-stage="failed"] {{ color: #b42318; font-weight: 700; }}
   </style>
 </head>
 <body>
@@ -357,7 +455,7 @@ def _browser_confirmation_document(token: str, binding_name: str) -> str:
     <p class="note">先切换到闲鱼标签页。扫码后还要在手机闲鱼中确认登录；
       二维码消失不代表登录已经完成。等待网页显示你的头像或昵称，再打开账号区域
       核对预期账号。全部完成以后，最后回到本页输入下方确认码。验证和保存结束后，
-      本工具启动的专用 Chrome 会自动关闭，这是正常的安全清理。</p>
+      本工具启动的专用浏览器会自动关闭，这是正常的安全清理。</p>
     <p><code>{visible_token}</code></p>
     <form id="confirmation-form">
       <label for="confirmation-input">确认码</label>
@@ -365,14 +463,32 @@ def _browser_confirmation_document(token: str, binding_name: str) -> str:
       <button type="submit">确认保存候选状态</button>
     </form>
     <p id="error" hidden>确认码不匹配，请重新核对。</p>
-    <p id="confirmed" hidden>已收到确认，请等待本地状态验证完成。</p>
+    <p id="status" data-stage="waiting" aria-live="polite">
+      尚未提交确认码；此页面会保留到保存结果明确以后。
+    </p>
   </main>
   <script>
     const bindingName = {binding_literal};
     const form = document.getElementById('confirmation-form');
     const input = document.getElementById('confirmation-input');
     const error = document.getElementById('error');
-    const confirmed = document.getElementById('confirmed');
+    const status = document.getElementById('status');
+    const stageMessages = {{
+      waiting: '尚未提交确认码；此页面会保留到保存结果明确以后。',
+      saving: '已收到确认，正在本地验证并保存候选状态，请不要关闭浏览器。',
+      saved: '候选状态已安全保存。专用浏览器将在 5 秒后自动关闭。',
+      'saved-warning': '候选状态已保存，但命令未完整结束；请回到终端查看原因。',
+      failed: '候选状态未完成保存，请回到终端查看安全处理后的原因。',
+    }};
+    const stageRanks = {{
+      waiting: 0, saving: 1, saved: 2, 'saved-warning': 2, failed: 2,
+    }};
+    window.__xianyuCaptureStage = (stage) => {{
+      if (!(stage in stageMessages)) return;
+      if (stageRanks[stage] < stageRanks[status.dataset.stage]) return;
+      status.dataset.stage = stage;
+      status.textContent = stageMessages[stage];
+    }};
     form.addEventListener('submit', async (event) => {{
       event.preventDefault();
       let accepted = false;
@@ -386,7 +502,7 @@ def _browser_confirmation_document(token: str, binding_name: str) -> str:
         return;
       }}
       error.hidden = true;
-      confirmed.hidden = false;
+      window.__xianyuCaptureStage('saving');
       input.disabled = true;
       form.querySelector('button').disabled = true;
     }});
@@ -401,13 +517,14 @@ def _read_browser_confirmation(
     token: str,
     timeout_seconds: float,
     progress: CaptureProgress,
-) -> None:
+) -> _BrowserConfirmationSession:
     """Wait for an explicit token typed by the user in a local-only page."""
 
     if timeout_seconds <= 0:
         raise TimeoutError("timed out before browser confirmation")
     confirmation_page = context.new_page()
     accepted = False
+    ownership_transferred = False
     binding_name = f"__xianyuConfirm{secrets.token_hex(8)}"
 
     def receive_confirmation(source: dict[str, Any], submitted: Any) -> bool:
@@ -459,12 +576,27 @@ def _read_browser_confirmation(
                 raise ValueError("browser confirmation did not complete") from exc
         progress.confirmation_received = True
         progress.confirmation_channel = "browser"
-    finally:
-        _cleanup_preserving_primary_error(
-            confirmation_page.close,
-            "failed to close the browser confirmation page",
-            progress,
+        print(
+            json.dumps(
+                {
+                    "status": "browser-confirmation-accepted",
+                    "state": "validating-before-save",
+                },
+                ensure_ascii=True,
+            ),
+            file=error_stream,
+            flush=True,
         )
+        session = _BrowserConfirmationSession(confirmation_page, error_stream)
+        ownership_transferred = True
+        return session
+    finally:
+        if not ownership_transferred:
+            _cleanup_preserving_primary_error(
+                confirmation_page.close,
+                "failed to close the browser confirmation page",
+                progress,
+            )
 
 
 def _validate_confirmation_page(url: str) -> None:
@@ -638,6 +770,7 @@ def capture_login_state(
     playwright_manager = sync_playwright()
     playwright: Any | None = None
     browser: Any | None = None
+    confirmation_session: _BrowserConfirmationSession | None = None
     try:
         try:
             playwright = playwright_manager.start()
@@ -675,7 +808,7 @@ def capture_login_state(
             deadline = time.monotonic() + timeout_seconds
             token = token_factory()
             if confirm_in_browser:
-                _read_browser_confirmation(
+                confirmation_session = _read_browser_confirmation(
                     context,
                     confirmation_errors,
                     token,
@@ -774,22 +907,38 @@ def capture_login_state(
                         capture_progress.cleanup_failures.append(failure)
                 raise
             mark_committed_state(saved_output)
+            if confirmation_session is not None:
+                confirmation_session.show_saved()
             return saved_output
     finally:
         try:
-            if browser is not None:
-                _cleanup_preserving_primary_error(
-                    browser.close,
-                    "failed to close the dedicated browser",
-                    capture_progress,
-                )
+            try:
+                active_error = sys.exc_info()[1]
+                if confirmation_session is not None and isinstance(
+                    active_error, Exception
+                ):
+                    if capture_progress.state_saved:
+                        confirmation_session.show_saved_with_warning()
+                    else:
+                        confirmation_session.show_failed()
+            finally:
+                if confirmation_session is not None:
+                    confirmation_session.close(capture_progress)
         finally:
-            if playwright is not None:
-                _cleanup_preserving_primary_error(
-                    playwright.stop,
-                    "failed to stop the dedicated browser runtime",
-                    capture_progress,
-                )
+            try:
+                if browser is not None:
+                    _cleanup_preserving_primary_error(
+                        browser.close,
+                        "failed to close the dedicated browser",
+                        capture_progress,
+                    )
+            finally:
+                if playwright is not None:
+                    _cleanup_preserving_primary_error(
+                        playwright.stop,
+                        "failed to stop the dedicated browser runtime",
+                        capture_progress,
+                    )
 
 
 def _capture_evidence(progress: CaptureProgress) -> dict[str, Any]:
@@ -854,7 +1003,7 @@ def _require_complete_capture(progress: CaptureProgress) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = JsonArgumentParser(
+    parser = LoginArgumentParser(
         description=(
             "Open a visible Xianyu browser and save candidate state "
             "after interactive confirmation"
@@ -945,15 +1094,17 @@ def _safe_capture_error_message(exc: Exception, args: argparse.Namespace) -> str
 
 @sigterm_cancellable
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    args.browser_channel = _resolve_browser_channel(args.browser_channel)
     progress = CaptureProgress()
+    args: argparse.Namespace | None = None
     try:
+        args = build_parser().parse_args(argv)
+        args.browser_channel = _resolve_browser_channel(args.browser_channel)
         if not args.confirm_in_browser and not _is_interactive_stream(sys.stdin):
             print(
                 json.dumps(
                     {
                         "ok": False,
+                        "exit_reason": "failed",
                         "error": (
                             "interactive terminal required; "
                             "the user must confirm personally"
@@ -998,6 +1149,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "ok": True,
+                    "exit_reason": "completed",
                     **_capture_evidence(progress),
                 },
                 ensure_ascii=True,
@@ -1009,6 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "ok": False,
+                    "exit_reason": "cancelled",
                     "error": "capture cancelled",
                     "error_type": type(exc).__name__,
                     **_capture_evidence(progress),
@@ -1025,11 +1178,17 @@ def main(argv: list[str] | None = None) -> int:
         PlaywrightError,
         BrowserCleanupError,
     ) as exc:
+        error_message = (
+            _safe_capture_error_message(exc, args)
+            if args is not None
+            else "login capture failed before arguments were accepted"
+        )
         print(
             json.dumps(
                 {
                     "ok": False,
-                    "error": _safe_capture_error_message(exc, args),
+                    "exit_reason": "failed",
+                    "error": error_message,
                     **_capture_evidence(progress),
                 },
                 ensure_ascii=True,
@@ -1041,6 +1200,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "ok": False,
+                    "exit_reason": "failed",
                     "error": "unexpected capture failure",
                     **_capture_evidence(progress),
                 },

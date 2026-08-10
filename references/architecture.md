@@ -13,6 +13,9 @@
 
 ## Runtime flow
 
+`doctor.py` is a read-only preflight outside the collection data path. It checks
+runtime and browser availability without starting Playwright or reading state.
+
 ```text
 User, Agent Skills host, or scheduler
                  |
@@ -57,6 +60,8 @@ this ordered boundary:
    `displayName` signal best-effort for at most 15 seconds.
 4. The storage snapshot is Goofish-filtered and must retain nonempty site
    material before atomic candidate persistence.
+5. Browser confirmation remains visible through persistence, reports the saved
+   candidate for five seconds, and then yields to ordered browser cleanup.
 
 Step 3 is optional evidence, not a save gate. An ordinary page, navigation, or
 response-probe failure degrades to `not-observed`; cancellation and cleanup
@@ -128,6 +133,9 @@ Each monitor run loads all active tasks or one selected task. For every task it:
 The optional `criteria` string is an opaque hint copied into monitor output for
 downstream agent analysis. It is not executable filter syntax. The collector
 enforces only the keyword, numeric price bounds, and location fields.
+Each task may also persist its browser executable channel. A monitor CLI
+override applies to every selected task; otherwise each task value precedes the
+environment default, so mixed active tasks can use different browsers.
 
 Use `monitor.py --baseline` before enabling notifications. It records current
 matches without reporting them as new. Without that flag, the first successful
@@ -174,6 +182,7 @@ preferable to permanently losing an item whose ID may already be committed.
       "pages": 2,
       "retries": 3,
       "state_file": "/private/path/state.json",
+      "browser_channel": "chrome",
       "status": "running",
       "seen_item_ids": [],
       "last_results": [],
@@ -228,11 +237,11 @@ silently filtering or rewriting tasks.
 
 ## Host boundary
 
-The portable runtime core consists of `SKILL.md`, the search/state/task/monitor
-commands in `scripts/`, and their API and architecture references. Its
-instruction metadata uses only standard Agent Skills frontmatter and
-skill-root-relative resources. Runtime collection uses Python, JSON, Playwright,
-a supported browser, and network access to Xianyu.
+The portable runtime core consists of `SKILL.md`, the read-only doctor and the
+search/state/task/monitor commands in `scripts/`, plus their API and architecture
+references. Its instruction metadata uses only standard Agent Skills frontmatter
+and skill-root-relative resources. Runtime collection uses Python, JSON,
+Playwright, a supported browser, and network access to Xianyu.
 
 Standard and enhanced storage state use a desktop context aligned with Xianyu's
 PC search API. Enhanced snapshots may override locale and timezone, but cannot

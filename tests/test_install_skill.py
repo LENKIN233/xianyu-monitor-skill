@@ -68,6 +68,7 @@ def test_copy_mode_uses_distributable_allowlist(tmp_path: Path) -> None:
     target = home / ".claude/skills/xianyu-monitor"
     assert (target / "SKILL.md").is_file()
     assert (target / "scripts/cdp_profile.py").is_file()
+    assert (target / "scripts/doctor.py").is_file()
     assert (target / "scripts/monitor.py").is_file()
     assert not (target / "scripts/state.json").exists()
     assert not (target / "tests").exists()

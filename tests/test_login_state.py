@@ -111,10 +111,14 @@ def test_browser_confirmation_is_local_only_and_records_its_channel() -> None:
         def wait_for_timeout(self, timeout: int) -> None:
             events.append(("wait", timeout))
             self.wait_count += 1
-            source = {"page": self, "frame": self.main_frame}
-            submitted = "SAVE-WRONG" if self.wait_count == 1 else "SAVE-SYNTHETIC"
-            accepted = self.binding(source, submitted)
-            events.append(("binding-result", accepted))
+            if self.wait_count <= 2:
+                source = {"page": self, "frame": self.main_frame}
+                submitted = "SAVE-WRONG" if self.wait_count == 1 else "SAVE-SYNTHETIC"
+                accepted = self.binding(source, submitted)
+                events.append(("binding-result", accepted))
+
+        def evaluate(self, expression: str, argument: str) -> None:
+            events.append(("evaluate", expression, argument))
 
         def close(self) -> None:
             events.append("close")
@@ -125,7 +129,7 @@ def test_browser_confirmation_is_local_only_and_records_its_channel() -> None:
 
     errors = io.StringIO()
     progress = login_state.CaptureProgress()
-    login_state._read_browser_confirmation(
+    session = login_state._read_browser_confirmation(
         Context(),
         errors,
         "SAVE-SYNTHETIC",
@@ -137,12 +141,40 @@ def test_browser_confirmation_is_local_only_and_records_its_channel() -> None:
     assert "SAVE-SYNTHETIC" in document
     assert "default-src 'none'" in document
     assert "SAVE-SYNTHETIC" not in errors.getvalue()
-    assert json.loads(errors.getvalue())["status"] == "browser-confirmation-ready"
+    progress_reports = [json.loads(line) for line in errors.getvalue().splitlines()]
+    assert [report["status"] for report in progress_reports] == [
+        "browser-confirmation-ready",
+        "browser-confirmation-accepted",
+    ]
     assert ("binding-result", False) in events
     assert ("binding-result", True) in events
     assert progress.confirmation_received is True
     assert progress.confirmation_channel == "browser"
+
+    session.show_saved()
+    session.close(progress)
+
+    assert (
+        "evaluate",
+        "stage => window.__xianyuCaptureStage(stage)",
+        "saved",
+    ) in events
+    stage_update = events.index(
+        (
+            "evaluate",
+            "stage => window.__xianyuCaptureStage(stage)",
+            "saved",
+        )
+    )
+    assert events[stage_update - 1] == "front"
+    assert ("wait", login_state.BROWSER_COMPLETION_DISPLAY_MS) in events
     assert events[-1] == "close"
+    progress_reports = [json.loads(line) for line in errors.getvalue().splitlines()]
+    assert progress_reports[-1] == {
+        "status": "browser-confirmation-complete",
+        "state": "candidate-saved",
+        "browser_close": "scheduled-after-display",
+    }
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX selector/pipe coverage")
@@ -384,7 +416,11 @@ def test_browser_confirmation_explains_scan_is_not_login_completion() -> None:
 
     assert "扫码后还要在手机闲鱼中确认登录" in document
     assert "二维码消失不代表登录已经完成" in document
-    assert "专用 Chrome 会自动关闭" in document
+    assert "专用浏览器会自动关闭" in document
+    assert "候选状态已安全保存。专用浏览器将在 5 秒后自动关闭" in document
+    assert "候选状态已保存，但命令未完整结束" in document
+    assert "候选状态未完成保存" in document
+    assert "stageRanks[stage] < stageRanks[status.dataset.stage]" in document
     assert "SAVE-1234" in document
 
 
@@ -672,6 +708,267 @@ def test_browser_confirmation_allows_non_tty_capture(
 
     assert output == tmp_path / "state.json"
     assert "browser-confirmed" in events
+
+
+def test_browser_confirmation_stays_open_until_candidate_is_saved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    state = {
+        "cookies": [
+            {
+                "name": "cookie2",
+                "value": "SYNTHETIC",
+                "domain": ".goofish.com",
+                "path": "/",
+            }
+        ],
+        "origins": [],
+    }
+    _install_fake_browser(monkeypatch, events, state)
+
+    class ConfirmationSession:
+        def show_saved(self) -> None:
+            events.append("confirmation-saved")
+
+        def show_failed(self) -> None:
+            pytest.fail("successful capture must not show a failed state")
+
+        def close(self, _progress: login_state.CaptureProgress) -> None:
+            events.append("confirmation-close")
+
+    def confirm_in_browser(
+        _context: Any,
+        _errors: Any,
+        _token: str,
+        _timeout: float,
+        progress: login_state.CaptureProgress,
+    ) -> ConfirmationSession:
+        events.append("browser-confirmed")
+        progress.confirmation_received = True
+        progress.confirmation_channel = "browser"
+        return ConfirmationSession()
+
+    monkeypatch.setattr(
+        login_state,
+        "_read_browser_confirmation",
+        confirm_in_browser,
+    )
+
+    output = login_state.capture_login_state(
+        str(tmp_path / "state.json"),
+        browser_channel=None,
+        timeout_seconds=5,
+        force=False,
+        confirm_in_browser=True,
+        input_stream=io.StringIO(),
+    )
+
+    assert output == tmp_path / "state.json"
+    assert events.index("storage-state") < events.index("confirmation-saved")
+    assert events.index("confirmation-saved") < events.index("confirmation-close")
+    assert events.index("confirmation-close") < events.index("browser-close")
+
+
+def test_browser_confirmation_reports_failure_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _install_fake_browser(monkeypatch, events, {"cookies": [], "origins": []})
+
+    class ConfirmationSession:
+        def show_saved(self) -> None:
+            pytest.fail("failed capture must not show a saved state")
+
+        def show_failed(self) -> None:
+            events.append("confirmation-failed")
+
+        def close(self, _progress: login_state.CaptureProgress) -> None:
+            events.append("confirmation-close")
+
+    def confirm_in_browser(
+        _context: Any,
+        _errors: Any,
+        _token: str,
+        _timeout: float,
+        progress: login_state.CaptureProgress,
+    ) -> ConfirmationSession:
+        progress.confirmation_received = True
+        progress.confirmation_channel = "browser"
+        return ConfirmationSession()
+
+    monkeypatch.setattr(
+        login_state,
+        "_read_browser_confirmation",
+        confirm_in_browser,
+    )
+
+    with pytest.raises(ValueError, match="no retained Goofish storage material"):
+        login_state.capture_login_state(
+            str(tmp_path / "state.json"),
+            browser_channel=None,
+            timeout_seconds=5,
+            force=False,
+            confirm_in_browser=True,
+            input_stream=io.StringIO(),
+        )
+
+    assert events.index("confirmation-failed") < events.index("confirmation-close")
+    assert events.index("confirmation-close") < events.index("browser-close")
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_browser_confirmation_reports_saved_candidate_with_command_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    state = {
+        "cookies": [
+            {
+                "name": "cookie2",
+                "value": "SYNTHETIC",
+                "domain": ".goofish.com",
+                "path": "/",
+            }
+        ],
+        "origins": [],
+    }
+    _install_fake_browser(monkeypatch, events, state)
+
+    class ConfirmationSession:
+        def show_saved(self) -> None:
+            pytest.fail("failed command must not show an unqualified success")
+
+        def show_saved_with_warning(self) -> None:
+            events.append("confirmation-saved-warning")
+
+        def show_failed(self) -> None:
+            pytest.fail("a committed candidate must not be reported as unsaved")
+
+        def close(self, _progress: login_state.CaptureProgress) -> None:
+            events.append("confirmation-close")
+
+    def confirm_in_browser(
+        _context: Any,
+        _errors: Any,
+        _token: str,
+        _timeout: float,
+        progress: login_state.CaptureProgress,
+    ) -> ConfirmationSession:
+        progress.confirmation_received = True
+        progress.confirmation_channel = "browser"
+        return ConfirmationSession()
+
+    def fail_after_commit(
+        output_file: str,
+        _state: dict[str, Any],
+        _force: bool,
+        *,
+        on_commit: Any,
+    ) -> Path:
+        output = Path(output_file)
+        output.write_text("{}", encoding="utf-8")
+        on_commit(output)
+        error = OSError("simulated post-commit cleanup failure")
+        error.credential_state_status = "candidate-saved"
+        error.credential_output = output
+        raise error
+
+    monkeypatch.setattr(
+        login_state,
+        "_read_browser_confirmation",
+        confirm_in_browser,
+    )
+    monkeypatch.setattr(login_state, "_secure_write_json", fail_after_commit)
+    progress = login_state.CaptureProgress()
+    output = tmp_path / "state.json"
+
+    with pytest.raises(OSError, match="post-commit cleanup failure"):
+        login_state.capture_login_state(
+            str(output),
+            browser_channel=None,
+            timeout_seconds=5,
+            force=False,
+            confirm_in_browser=True,
+            input_stream=io.StringIO(),
+            progress=progress,
+        )
+
+    assert progress.state_saved is True
+    assert progress.state_commit_status == "candidate-saved"
+    assert output.is_file()
+    assert events.index("confirmation-saved-warning") < events.index(
+        "confirmation-close"
+    )
+    assert events.index("confirmation-close") < events.index("browser-close")
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, asyncio.CancelledError])
+def test_browser_confirmation_does_not_delay_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+) -> None:
+    events: list[str] = []
+    state = {
+        "cookies": [
+            {
+                "name": "cookie2",
+                "value": "SYNTHETIC",
+                "domain": ".goofish.com",
+                "path": "/",
+            }
+        ],
+        "origins": [],
+    }
+    _install_fake_browser(monkeypatch, events, state)
+
+    class ConfirmationSession:
+        def show_saved(self) -> None:
+            pytest.fail("cancelled capture must not show a saved state")
+
+        def show_failed(self) -> None:
+            pytest.fail("cancellation must not wait on a failure page")
+
+        def close(self, _progress: login_state.CaptureProgress) -> None:
+            events.append("confirmation-close")
+
+    def confirm_in_browser(
+        _context: Any,
+        _errors: Any,
+        _token: str,
+        _timeout: float,
+        progress: login_state.CaptureProgress,
+    ) -> ConfirmationSession:
+        progress.confirmation_received = True
+        progress.confirmation_channel = "browser"
+        return ConfirmationSession()
+
+    def cancel_validation(_url: str) -> None:
+        raise interruption
+
+    monkeypatch.setattr(
+        login_state,
+        "_read_browser_confirmation",
+        confirm_in_browser,
+    )
+    monkeypatch.setattr(login_state, "_validate_confirmation_page", cancel_validation)
+
+    with pytest.raises(interruption):
+        login_state.capture_login_state(
+            str(tmp_path / "state.json"),
+            browser_channel=None,
+            timeout_seconds=5,
+            force=False,
+            confirm_in_browser=True,
+            input_stream=io.StringIO(),
+        )
+
+    assert events.index("confirmation-close") < events.index("browser-close")
+    assert not (tmp_path / "state.json").exists()
 
 
 def test_state_is_saved_only_after_confirmation_and_nav_display_name(
@@ -1338,6 +1635,7 @@ def test_success_output_separates_state_identity_and_search(
     opening = json.loads(captured.err)
 
     assert opening["status"] == "browser-opening"
+    assert payload["exit_reason"] == "completed"
     assert payload["state"]["status"] == "candidate-saved"
     assert payload["confirmation"]["status"] == "interactive-token-received"
     assert payload["confirmation"]["actor"] == "not-machine-verified"
@@ -1435,8 +1733,31 @@ def test_main_rejects_cdp_before_capture(
     assert captured.value.code == 2
     output = capsys.readouterr()
     payload = json.loads(output.out)
+    assert payload["exit_reason"] == "failed"
     assert "raw TCP CDP is disabled" in payload["error"]
     assert str(tmp_path / "profile") not in output.out
+    assert output.err == ""
+
+
+def test_login_argument_errors_do_not_echo_private_values(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_value = str(tmp_path / "account-name-must-not-leak")
+
+    with pytest.raises(SystemExit) as captured:
+        login_state.main(["--unknown", private_value])
+
+    assert captured.value.code == 2
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    assert payload == {
+        "ok": False,
+        "exit_reason": "failed",
+        "error": "invalid login arguments; run --help",
+        "error_type": "ArgumentError",
+    }
+    assert private_value not in output.out
     assert output.err == ""
 
 
@@ -1522,9 +1843,28 @@ def test_tty_probe_cancellation_is_structured_once(
     assert len(output_lines) == 1
     payload = json.loads(output_lines[0])
     assert payload["error"] == "capture cancelled"
+    assert payload["exit_reason"] == "cancelled"
     assert payload["error_type"] == error_type
     assert payload["state"]["status"] == "not-saved"
     assert payload["confirmation"]["status"] == "not-received"
+
+
+def test_argument_parsing_cancellation_is_structured(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class CancellingParser:
+        def parse_args(self, _argv: list[str] | None) -> None:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(login_state, "build_parser", CancellingParser)
+
+    assert login_state.main(["--output", "unused"]) == 130
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["exit_reason"] == "cancelled"
+    assert payload["error_type"] == "CancelledError"
+    assert payload["state"] == {"status": "not-saved"}
 
 
 @pytest.mark.parametrize(

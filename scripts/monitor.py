@@ -284,14 +284,17 @@ async def run_tasks(
             )
         prepared_tasks.append((task, state_file))
 
-    browser_channel = _resolve_browser_channel(
-        getattr(args, "browser_channel", None),
-    )
+    browser_channel_override = getattr(args, "browser_channel", None)
+    if isinstance(browser_channel_override, str):
+        browser_channel_override = browser_channel_override.strip() or None
     reports = run_progress.reports
     had_error = False
     for task, state_file in prepared_tasks:
         _raise_if_task_cancelling()
         task_id = task["id"]
+        browser_channel = _resolve_browser_channel(
+            browser_channel_override or task.get("browser_channel"),
+        )
         items: list[dict[str, Any]] = []
         search_passed = False
         spider: XianyuSpider | None = None

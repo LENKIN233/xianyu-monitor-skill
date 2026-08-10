@@ -48,8 +48,15 @@ From `SKILL_ROOT`, use Python 3.10 or newer:
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements.txt
-python -m playwright install chromium
+python scripts/doctor.py
 ```
+
+`doctor.py` is read-only: it launches no browser, writes no file, and emits no
+local path. If it reports `install-browser`, run
+`python -m playwright install chromium` and check again. Do not download bundled
+Chromium when local Chrome already yields `ready-use-browser-channel`; pass
+`--browser-channel chrome` to browser commands instead. Stop and follow any
+other non-ready `next_action` before continuing.
 
 On Windows PowerShell:
 
@@ -58,7 +65,7 @@ py -3 -c "import sys; assert sys.version_info >= (3, 10), 'Python 3.10+ required
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python -m playwright install chromium
+python scripts\doctor.py
 ```
 
 Scheduled Windows commands should call `.\.venv\Scripts\python.exe` directly.
@@ -121,6 +128,10 @@ type, pipe, infer, or reuse it for the user. Non-interactive input, EOF, or a
 wrong token fail without saving. `--confirm-in-browser` moves the same deliberate
 confirmation into a local-only page opened by this command and is the only mode that
 permits non-interactive command input.
+After acceptance, that page remains open through validation and atomic save. It
+shows the saved candidate outcome for five seconds before automatic cleanup;
+success also returns `exit_reason: completed`. Do not mistake this candidate
+save message for authentication, identity, or search proof.
 
 Save a candidate only after all required gates pass: final user confirmation,
 the original tab is a normal HTTPS Goofish page rather than a login/challenge
@@ -286,6 +297,11 @@ location are enforced as search filters.
 Task files are schema-validated as a whole, including field types, unique IDs,
 bounded lists, and finite prices. If any entry is invalid, stop without
 rewriting the file; never silently discard an unknown or malformed task.
+The browser channel is part of the task definition. Mixed active tasks may use
+different channels. Runtime precedence is monitor CLI override, task value,
+`XIANYU_BROWSER_CHANNEL`, then the Playwright default.
+When doctor returns `ready-use-browser-channel`, add
+`--browser-channel chrome` to task creation so scheduled runs retain it.
 
 Read `result.id` from successful create output. Use that ID to scope baseline
 and scheduling unless the user explicitly authorized every active task in the
@@ -376,6 +392,9 @@ operating-system scheduler.
 
 ## Troubleshoot
 
+- First-run uncertainty: run `python scripts/doctor.py` and follow its stable
+  `next_action`; optional private-directory flags check access without echoing
+  their paths.
 - `SearchTransportError`: allow only the configured bounded retry loop; it
   represents a transient intercepted-response transport failure.
 - `SearchCaptureError`: do not retry automatically. If a supplied candidate

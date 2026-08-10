@@ -249,6 +249,7 @@ def test_legacy_task_files_remain_compatible(
     assert task is not None
     assert task["pages"] == 1
     assert task["retries"] == 3
+    assert task["browser_channel"] is None
     assert task["seen_item_ids"] == []
     assert "notification" not in task
 
@@ -286,6 +287,7 @@ def test_non_object_task_entry_is_rejected_without_rewriting_file(
         ("retries", 0, "retries must be an integer of at least 1"),
         ("status", "paused", "status must be running or stopped"),
         ("state_file", 7, "state_file must be a string or null"),
+        ("browser_channel", 7, "browser_channel must be a string or null"),
         ("results_count", -1, "results_count must be a non-negative integer"),
         ("last_results", ["not-an-object"], "last_results entries must be objects"),
         ("seen_item_ids", [None], "seen_item_ids entries must be non-empty strings"),
@@ -474,6 +476,50 @@ def test_deduplication_includes_all_task_definition_fields(tmp_path: Path) -> No
 
     assert revised["id"] != original["id"]
     assert len(manager.list_tasks()) == 2
+
+
+def test_browser_channel_round_trips_and_participates_in_deduplication(
+    tmp_path: Path,
+) -> None:
+    manager = TaskManager(str(tmp_path / "tasks.json"))
+
+    chrome = manager.create_task("MacBook", browser_channel="  chrome  ")
+    chrome_duplicate = manager.create_task("MacBook", browser_channel="chrome")
+    edge = manager.create_task("MacBook", browser_channel="msedge")
+    default = manager.create_task("MacBook")
+
+    assert chrome["browser_channel"] == "chrome"
+    assert chrome_duplicate["id"] == chrome["id"]
+    assert chrome_duplicate["existing"] is True
+    assert edge["id"] != chrome["id"]
+    assert default["id"] not in {chrome["id"], edge["id"]}
+    assert default["browser_channel"] is None
+    assert len(manager.list_tasks()) == 3
+
+
+def test_create_cli_persists_browser_channel(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tasks_file = tmp_path / "tasks.json"
+
+    exit_code = task_manager.main(
+        [
+            "--data-file",
+            str(tasks_file),
+            "create",
+            "相机",
+            "--browser-channel",
+            "chrome",
+        ]
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert report["ok"] is True
+    assert report["result"]["browser_channel"] == "chrome"
+    stored = TaskManager(str(tasks_file)).list_tasks()
+    assert stored[0]["browser_channel"] == "chrome"
 
 
 def test_record_run_interrupted_after_replace_carries_committed_new_items(

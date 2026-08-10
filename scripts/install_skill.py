@@ -40,6 +40,7 @@ REQUIRED_COPY_FILES = (
     "scripts/cdp_profile.py",
     "scripts/cli_contract.py",
     "scripts/create_state.py",
+    "scripts/doctor.py",
     "scripts/install_skill.py",
     "scripts/login_state.py",
     "scripts/monitor.py",
