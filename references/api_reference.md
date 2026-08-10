@@ -2,6 +2,7 @@
 
 ## Contents
 
+- [doctor.py](#doctorpy)
 - [spider.py](#spiderpy)
 - [task_manager.py](#task_managerpy)
 - [monitor.py](#monitorpy)
@@ -21,6 +22,25 @@ clients. The former `--cdp-user-data-dir` option is hidden on the search,
 monitor, and login entrypoints solely so upgrades receive the structured
 `ArgumentError` response; it never opens a connection. Run browser work on the
 trusted browser-owning host with `--browser-channel chrome` instead.
+
+## `doctor.py`
+
+Run read-only prerequisite checks before login or search:
+
+```text
+--state-output-dir  Optionally check one existing private state-output directory
+--tasks-dir         Optionally check one existing private task directory
+```
+
+The command does not launch a browser, import Playwright, write files, inspect
+credential contents, or echo supplied paths. It checks Python 3.10+, required
+imports, installed Playwright Chromium executables, local Chrome at the exact
+paths used by Playwright's `chrome` channel, and only the directory metadata
+explicitly requested. Output has
+stable top-level `ok`, `checks`, and `next_action` fields. Exit is `0` when all
+required checks pass and `2` otherwise. `next_action.code` is one of
+`upgrade-python`, `install-dependencies`, `install-browser`,
+`fix-private-directories`, `ready`, or `ready-use-browser-channel`.
 
 ## `spider.py`
 
@@ -126,6 +146,7 @@ Create options:
 --pages
 --retries
 --state
+--browser-channel
 --allow-duplicate
 ```
 
@@ -152,6 +173,7 @@ baseline and monitor commands:
     "id": "task_0123456789ab",
     "keyword": "MacBook Air M2",
     "state_file": "/absolute/private/path/xianyu-state.json",
+    "browser_channel": "chrome",
     "status": "running"
   }
 }
@@ -194,9 +216,9 @@ boolean as `updated`; `delete` uses `deleted`; `create` returns the task object.
 
 An equivalent active task is returned with `"existing": true` unless
 `--allow-duplicate` was supplied. Equivalence includes every task-defining
-field: keyword, price bounds, location, criteria, pages, retries, and normalized
-state path. Do not automatically baseline an existing task, because doing so
-can suppress pending new-item notifications.
+field: keyword, price bounds, location, criteria, pages, retries, normalized
+state path, and normalized browser channel. Do not automatically baseline an
+existing task, because doing so can suppress pending new-item notifications.
 
 `criteria` is stored and returned unchanged as an optional downstream analysis
 hint. The deterministic collector does not execute it. Only keyword, numeric
@@ -237,6 +259,9 @@ sets top-level `"ok": false` and causes a nonzero exit.
 A missing task file is an error, never an implicit empty task set.
 A stopped task is rejected even when selected explicitly with `--task-id`;
 resume it before invoking its pinned monitor command.
+Each task may persist a different browser channel. A monitor-level
+`--browser-channel` overrides every selected task; otherwise each task value
+wins over `XIANYU_BROWSER_CHANNEL`, which in turn precedes the Playwright default.
 
 Successful output has this shape:
 
@@ -389,6 +414,12 @@ random `SAVE-...` token to the interactive terminal. Agents must pause for the
 user to provide that exact token and must not enter or pipe it for them.
 `--confirm-in-browser` instead presents the token on a local-only page and
 permits a non-TTY command; the agent must release that page to the user.
+After token acceptance, this page stays open while validation and persistence
+run. It shows `candidate-saved` for five seconds before the dedicated browser is
+closed; a pre-save failure shows a generic failure state instead. If persistence
+committed but a later writer step failed, it says the candidate was saved while
+the command was incomplete. These page messages never claim authentication,
+identity, or search capability.
 Default-mode non-TTY input, EOF, a wrong token, a login/challenge page, or no
 retained filtered Goofish browser-storage material fails without writing.
 
@@ -412,14 +443,20 @@ authentication or identity proof. The raw response can contain identity fields,
 so the command does not copy it into output or state. It writes only filtered
 Playwright state atomically, uses `0600` permissions where supported, creates a
 missing containing directory as `0700`, and rejects a final output symlink.
-The `browser-opening` progress object goes to stderr. Stdout contains exactly one
-final success, failure, or cancellation JSON object.
+The `browser-opening`, `browser-confirmation-ready`,
+`browser-confirmation-accepted`, and `browser-confirmation-complete` progress
+objects go to stderr. If the candidate committed but a later writer step fails,
+stderr instead adds `browser-confirmation-warning` and the page distinguishes
+the saved candidate from the failed command. Stdout contains exactly one final
+success, failure, or cancellation JSON object with `exit_reason` set to
+`completed`, `failed`, or `cancelled`.
 
 Success keeps evidence dimensions separate:
 
 ```json
 {
   "ok": true,
+  "exit_reason": "completed",
   "state": {
     "status": "candidate-saved"
   },

@@ -90,6 +90,15 @@ def test_explicit_cdp_is_rejected_before_environment_resolution(
     assert _resolve_browser_channel(None) == "chrome"
 
 
+def test_explicit_browser_channel_is_normalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XIANYU_BROWSER_CHANNEL", "chrome")
+
+    assert _resolve_browser_channel("  msedge  ") == "msedge"
+    assert _resolve_browser_channel("   ") == "chrome"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink coverage")
 def test_configured_temp_root_cannot_promote_user_symlink(
     tmp_path: Path,

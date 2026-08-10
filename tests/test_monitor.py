@@ -52,6 +52,56 @@ def test_monitor_persists_seen_items(tmp_path: Path, monkeypatch: Any) -> None:
     assert first[0]["identity"]["status"] == "not-evaluated"
 
 
+def test_monitor_resolves_browser_channel_per_task_with_cli_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks_file = tmp_path / "tasks.json"
+    manager = TaskManager(str(tasks_file))
+    manager.create_task("Chrome task", browser_channel="chrome")
+    manager.create_task("Edge task", browser_channel="msedge")
+    manager.create_task("Default task")
+    observed_channels: list[str | None] = []
+
+    class ChannelCapturingSpider(FakeSpider):
+        def __init__(
+            self,
+            *_args: Any,
+            browser_channel: str | None = None,
+            **_kwargs: Any,
+        ):
+            super().__init__()
+            observed_channels.append(browser_channel)
+
+    monkeypatch.setenv("XIANYU_BROWSER_CHANNEL", "chrome-beta")
+    monkeypatch.setattr(monitor, "XianyuSpider", ChannelCapturingSpider)
+    args = argparse.Namespace(
+        tasks_file=str(tasks_file),
+        task_id=None,
+        state=None,
+        proxy=None,
+        headed=False,
+        browser_channel=None,
+        include_seen=False,
+        baseline=False,
+    )
+
+    reports, had_error = asyncio.run(monitor.run_tasks(args))
+
+    assert had_error is False
+    assert len(reports) == 3
+    assert observed_channels == ["chrome", "msedge", "chrome-beta"]
+
+    observed_channels.clear()
+    args.browser_channel = "  chromium  "
+
+    reports, had_error = asyncio.run(monitor.run_tasks(args))
+
+    assert had_error is False
+    assert len(reports) == 3
+    assert observed_channels == ["chromium", "chromium", "chromium"]
+
+
 def test_monitor_parser_rejects_raw_cdp_without_echoing_path(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

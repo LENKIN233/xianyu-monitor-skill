@@ -36,8 +36,14 @@ git clone https://github.com/LENKIN233/xianyu-monitor-skill.git xianyu-monitor
 cd xianyu-monitor
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m playwright install chromium
+.venv/bin/python scripts/doctor.py
 ```
+
+`doctor.py` 只读检查 Python、依赖和可用浏览器，不启动浏览器、不写文件，也不回显
+本地路径。若返回 `install-browser`，再执行
+`.venv/bin/python -m playwright install chromium` 并重跑；已有本机 Chrome 时不会要求
+下载重复浏览器。`ok: false` 时按 `next_action` 修复；如果只发现本机 Chrome，后续命令
+按提示增加 `--browser-channel chrome`。
 
 ### 2. 在专用浏览器中登录
 
@@ -48,9 +54,11 @@ python3 -m venv .venv
 ```
 
 只在命令新开的专用浏览器窗口中登录。二维码消失不代表登录完成；还需要完成手机确认，
-回到正常 Goofish 页面，并在本地确认页提交一次性确认码。状态验证和保存完成后，专用
-浏览器自动关闭是正常安全清理，不是闪退。本地安装了 Chrome 且希望明确使用它时，
-增加 `--browser-channel chrome`；这仍会创建独立上下文，不复用日常浏览器 profile。
+回到正常 Goofish 页面，并在本地确认页提交一次性确认码。确认页会依次显示“正在验证
+并保存”和“候选状态已安全保存”，成功结果保留 5 秒后才自动关闭专用浏览器；最终 JSON
+同时返回 `"exit_reason": "completed"`。这是正常安全清理，不是闪退。本地安装了 Chrome
+且希望明确使用它时，增加 `--browser-channel chrome`；这仍会创建独立上下文，不复用
+日常浏览器 profile。
 
 ### 3. 执行一次受控搜索
 
@@ -105,8 +113,11 @@ Windows PowerShell 使用 `.\.venv\Scripts\python.exe` 代替
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m playwright install chromium
+.\.venv\Scripts\python.exe scripts\doctor.py
 ```
+
+Windows 上也只在 `next_action.code` 为 `install-browser` 时运行
+`.\.venv\Scripts\python.exe -m playwright install chromium`。
 
 ## 浏览器状态
 
@@ -278,6 +289,10 @@ python scripts/task_manager.py \
 
 任务文件按完整 schema 加载：字段类型、ID 唯一性、列表上限和有限价格都会验证。任一
 条目损坏时整次操作失败且不重写原文件，不会静默丢弃无法识别的任务。
+浏览器通道会随任务保存；同一任务文件中的任务可以分别使用不同通道。运行时优先级为
+监控命令的 `--browser-channel` 覆盖值、任务保存值、`XIANYU_BROWSER_CHANNEL` 环境默认值，
+最后才是 Playwright 默认浏览器。只有 `doctor.py` 返回
+`ready-use-browser-channel` 时，才在创建命令末尾增加 `--browser-channel chrome`。
 
 第一次运行先建立“不通知存量商品”的基线：
 
@@ -369,8 +384,10 @@ Codex、Claude Code 与 OpenClaw 的 Agent 定时提示词、发现目录和 Ope
 
 ### 为什么确认后浏览器会关闭？
 
-候选状态验证并保存后，命令会主动关闭专用浏览器并释放临时资源。这是正常清理；是否
-真正可搜索仍以紧随其后的受控搜索结果为准。
+本地确认页会先显示验证中；真正完成原子保存后再显示“候选状态已安全保存”，保留 5 秒
+才主动关闭专用浏览器并释放临时资源。最终成功 JSON 的 `exit_reason` 是 `completed`；
+失败与用户取消分别是 `failed` 和 `cancelled`。是否真正可搜索仍以紧随其后的受控搜索
+结果为准。
 
 ## 开发与验证
 
@@ -393,8 +410,10 @@ smoke test，必须由用户本人在本机可见浏览器中登录并输入一�
 - 登录状态相当于账号凭证，不要上传、截图或发给他人。
 - 状态与任务文件应放在 checkout 之外；确需放入仓库目录时，只使用已整体忽略的
   根目录 `private/`，不要依赖自定义文件名恰好被忽略。
-- 登录命令只在 stdout 输出一个最终 JSON；`browser-opening` 和可选的
-  `browser-confirmation-ready` 进度写入 stderr。
+- 登录命令只在 stdout 输出一个最终 JSON；`browser-opening`、
+  `browser-confirmation-ready`、`browser-confirmation-accepted` 和
+  `browser-confirmation-complete`（或保存后命令未完整结束时的
+  `browser-confirmation-warning`）进度写入 stderr。
 - 登录命令不会在 JSON 或进度中回显私有状态路径；即便如此，也不要把
   本地登录日志上传到 CI、工单或公共聊天。
 - 建议监控间隔不少于 30 分钟。

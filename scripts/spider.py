@@ -1252,7 +1252,9 @@ def _resolve_browser_channel(
     """Use an explicit browser channel before the environment default."""
 
     if explicit_channel:
-        return explicit_channel
+        normalized = explicit_channel.strip()
+        if normalized:
+            return normalized
     configured = os.getenv("XIANYU_BROWSER_CHANNEL", "").strip()
     return configured or None
 

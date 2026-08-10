@@ -30,6 +30,7 @@ def test_every_referenced_skill_resource_exists() -> None:
         "references/architecture.md",
         "references/host_adapters.md",
         "scripts/create_state.py",
+        "scripts/doctor.py",
         "scripts/login_state.py",
         "scripts/monitor.py",
         "scripts/spider.py",
