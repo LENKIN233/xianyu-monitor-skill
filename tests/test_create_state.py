@@ -265,6 +265,101 @@ def test_secure_write_stages_privately_with_restrictive_permissions(
     assert not list(tmp_path.glob(".state.json.*.tmp"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission coverage")
+def test_secure_write_fails_closed_when_fchmod_fails_in_existing_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "state.json"
+
+    def reject_fchmod(_descriptor: int, _mode: int) -> None:
+        raise PermissionError("simulated fchmod denial")
+
+    monkeypatch.setattr(create_state.os, "fchmod", reject_fchmod)
+
+    with pytest.raises(PermissionError, match="simulated fchmod denial"):
+        create_state._secure_write_json(  # noqa: SLF001
+            str(output),
+            {"cookies": [], "origins": []},
+            False,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".state.json.*.tmp"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission coverage")
+def test_secure_write_fails_closed_when_new_parent_chmod_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "private"
+    output = parent / "state.json"
+    original_chmod = Path.chmod
+
+    def reject_parent_chmod(path: Path, mode: int) -> None:
+        if path == parent:
+            raise PermissionError("simulated parent chmod denial")
+        original_chmod(path, mode)
+
+    monkeypatch.setattr(Path, "chmod", reject_parent_chmod)
+
+    with pytest.raises(PermissionError, match="simulated parent chmod denial"):
+        create_state._secure_write_json(  # noqa: SLF001
+            str(output),
+            {"cookies": [], "origins": []},
+            False,
+        )
+
+    assert not output.exists()
+    assert not list(parent.glob(".state.json.*.tmp"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission coverage")
+def test_secure_write_rejects_staged_file_not_owned_by_current_user(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "state.json"
+    real_effective_uid = os.geteuid()
+    monkeypatch.setattr(create_state.os, "geteuid", lambda: real_effective_uid + 1)
+
+    with pytest.raises(OSError, match="not owned by the current user"):
+        create_state._secure_write_json(  # noqa: SLF001
+            str(output),
+            {"cookies": [], "origins": []},
+            False,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".state.json.*.tmp"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission coverage")
+def test_secure_write_removes_published_file_when_final_mode_is_not_private(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "state.json"
+    original_link = create_state.os.link
+
+    def publish_with_insecure_mode(source: Path, target: Path) -> None:
+        original_link(source, target)
+        Path(target).chmod(0o644)
+
+    monkeypatch.setattr(create_state.os, "link", publish_with_insecure_mode)
+
+    with pytest.raises(OSError, match="permissions are not 0600"):
+        create_state._secure_write_json(  # noqa: SLF001
+            str(output),
+            {"cookies": [], "origins": []},
+            False,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".state.json.*.tmp"))
+
+
 def test_credential_stage_directory_creation_interruption_leaves_no_residue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

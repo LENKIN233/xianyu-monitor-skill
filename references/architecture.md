@@ -3,6 +3,7 @@
 ## Contents
 
 - [Runtime flow](#runtime-flow)
+- [Login candidate evidence](#login-candidate-evidence)
 - [Search capture](#search-capture)
 - [Filtering and pagination](#filtering-and-pagination)
 - [Persistent monitoring](#persistent-monitoring)
@@ -41,6 +42,34 @@ new items. The calling host owns scheduling and delivery.
 The scripts do not perform purchases, seller messaging, or external
 notifications.
 
+## Login candidate evidence
+
+`login_state.py` uses a 1800-second default login window. QR scanning is not a
+completion signal: the user may still need to approve the login on the phone,
+and a disappearing QR does not prove that step finished. Candidate capture uses
+this ordered boundary:
+
+1. The user completes the browser and phone steps and submits final explicit
+   confirmation.
+2. The original tab must be a normal HTTPS Goofish page, not a login,
+   challenge, CAPTCHA, or risk-control page.
+3. Only after confirmation, a fresh page observes the PC navigation
+   `displayName` signal best-effort for at most 15 seconds.
+4. The storage snapshot is Goofish-filtered and must retain nonempty site
+   material before atomic candidate persistence.
+
+Step 3 is optional evidence, not a save gate. An ordinary page, navigation, or
+response-probe failure degrades to `not-observed`; cancellation and cleanup
+failures remain terminal. If observed, session reports
+`nav_display_name: present` and identity remains `not-machine-verified`; if
+absent, session reports `not-observed` and identity is `not-established`.
+Authentication remains `not-established` in both cases, and search capability
+remains `not-tested` until the saved candidate completes a real search.
+
+Every saved candidate must therefore be followed by a real search requiring
+`search_capability.status: passed-for-this-run`. That result proves only search
+capability for that run, never authentication or account identity.
+
 ## Search capture
 
 The browser context installs a route only for the canonical HTTPS endpoint:
@@ -66,6 +95,9 @@ an asynchronous response event can lose access to the response body.
 Only 2xx responses with strict `SUCCESS::` `ret` markers are accepted.
 Non-success markers or statuses become `SearchRejectedError`. A rejected
 request is never reported as a valid empty search.
+Failures while fetching, reading, or fulfilling an intercepted response become
+`SearchTransportError` and use the bounded retry loop. A response that arrives
+but cannot satisfy the capture contract becomes terminal `SearchCaptureError`.
 
 ## Filtering and pagination
 
@@ -174,12 +206,18 @@ Old task entries are normalized with missing version-2 fields when loaded.
 Notification fields from older files are removed because delivery belongs to
 the calling host, not the task data model. Seen-item history keeps the latest
 50,000 IDs.
+Before normalization is committed, the complete file is schema-validated for
+field types, unique IDs, bounded collections, and finite numeric prices.
+Malformed entries and non-standard `NaN`/infinity constants fail closed without
+silently filtering or rewriting tasks.
 
 ## Security boundaries
 
 - Login state and proxy credentials are secrets.
 - Proxy logs contain only scheme, host, and port.
 - Browser sandbox and same-origin protections remain enabled.
+- Raw external TCP CDP is disabled because Chrome provides no client
+  authentication for local debugging clients.
 - Enhanced snapshots may supply locale, timezone, and safe headers; Cookie,
   Host, Origin, Referer, User-Agent, mobile, touch, and viewport settings are
   not replayed into the fixed desktop PC-search context.
@@ -202,21 +240,18 @@ switch viewport, user agent, touch, or mobile settings. Search response routing
 blocks service workers so the exact API response remains observable; GET and
 POST are supported while preflight methods are ignored.
 
-The optional CDP transport separates browser ownership from credential input.
-Login capture may inspect the single default context of an explicitly dedicated
-temporary Chrome profile, then applies the same Goofish allowlist before atomic
-persistence. Search never consumes that default context: it requires an
-authorized state file and creates an isolated context inside the connected
-browser. Search explicitly closes that isolated context before disconnecting;
-the externally launched Chrome remains user-owned. An initialized sentinel,
-the loopback `DevToolsActivePort`, and Chrome's reported `--user-data-dir` bind
-the approved path immediately after transport connection and before application
-code reads default-context storage or creates a search context. The transport
-may enumerate target metadata while connecting. Default browser data
-directories, user-controlled symlink components, non-private POSIX directories,
-mismatched browser arguments, non-loopback endpoints, and ambiguous context
-sets fail closed. Standard operating-system temp-root aliases are canonicalized
-before these checks.
+Login and search browsers are Playwright-owned. Selecting
+`--browser-channel chrome` changes only the executable; it never reuses a daily
+profile or attaches to an existing browser. The legacy
+`--cdp-user-data-dir` entrypoint option is hidden and fails with structured
+`ArgumentError` JSON before connection. If a sandbox cannot launch a browser,
+the complete login/search/monitor workflow stays on the trusted browser-owning
+host, whose scheduler references a `0600` state file; a sandbox may receive only
+sanitized listing JSON.
+
+`cdp_profile.py` remains solely as a guarded migration cleanup for exact legacy
+temporary profiles. It cannot initialize a new profile and refuses cleanup
+while old Chrome activity or a debugging listener remains.
 
 Packaging and host integration remain optional:
 
@@ -233,3 +268,7 @@ stdout-driven schedulers. It suppresses routine scraper diagnostics throughout
 the invocation and suppresses final JSON only after a successful zero-new run.
 Failures still produce JSON and a nonzero exit status. It is mutually exclusive
 with both `--include-seen` and the verification-producing `--baseline` mode.
+
+Public CLI parsing failures are one stdout `ArgumentError` JSON object
+with exit `2`. Scheduler `SIGTERM` is translated into controlled cancellation,
+so normal cleanup and persistence evidence are emitted before exit `130`.

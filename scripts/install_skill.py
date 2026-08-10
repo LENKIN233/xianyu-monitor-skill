@@ -19,6 +19,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .cli_contract import JsonArgumentParser, sigterm_cancellable
+else:
+    from cli_contract import JsonArgumentParser, sigterm_cancellable
+
 SKILL_NAME = "xianyu-monitor"
 HOST_ROOTS = {
     "codex": Path(".agents/skills"),
@@ -33,6 +38,7 @@ REQUIRED_COPY_FILES = (
     "requirements.txt",
     "scripts/__init__.py",
     "scripts/cdp_profile.py",
+    "scripts/cli_contract.py",
     "scripts/create_state.py",
     "scripts/install_skill.py",
     "scripts/login_state.py",
@@ -1107,7 +1113,7 @@ def install_skill(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = JsonArgumentParser(
         description="Install xianyu-monitor into Agent Skills discovery roots"
     )
     parser.add_argument(
@@ -1132,6 +1138,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@sigterm_cancellable
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     progress = InstallProgress(mode=args.mode, dry_run=args.dry_run)

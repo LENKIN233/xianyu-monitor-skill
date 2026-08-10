@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Initialize or safely remove a dedicated Xianyu CDP profile."""
+"""Safely remove a legacy dedicated Xianyu CDP profile."""
 
 from __future__ import annotations
 
@@ -15,69 +15,20 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 if __package__:
+    from .cli_contract import JsonArgumentParser, sigterm_cancellable
+else:
+    from cli_contract import JsonArgumentParser, sigterm_cancellable
+
+if __package__:
     from .spider import (
-        CDP_PROFILE_SENTINEL_NAME,
-        CDP_PROFILE_SENTINEL_VALUE,
         _cdp_endpoint_from_user_data_dir,
         _private_cdp_profile_path,
-        _resolve_temporary_cdp_directory,
     )
 else:
     from spider import (
-        CDP_PROFILE_SENTINEL_NAME,
-        CDP_PROFILE_SENTINEL_VALUE,
         _cdp_endpoint_from_user_data_dir,
         _private_cdp_profile_path,
-        _resolve_temporary_cdp_directory,
     )
-
-
-def initialize_cdp_profile(directory: str) -> Path:
-    """Mark one existing empty, private directory for dedicated CDP use."""
-
-    profile = _resolve_temporary_cdp_directory(directory)
-    if os.name != "nt":
-        metadata = profile.stat()
-        if metadata.st_uid != os.getuid():
-            raise ValueError("CDP user-data directory must be user-owned")
-        if stat.S_IMODE(metadata.st_mode) & 0o077:
-            raise ValueError(
-                "CDP user-data directory must be private; run chmod 700 on it"
-            )
-    try:
-        if any(profile.iterdir()):
-            raise ValueError("CDP user-data directory must be empty before setup")
-    except OSError as exc:
-        raise ValueError("unable to inspect CDP user-data directory") from exc
-
-    sentinel = profile / CDP_PROFILE_SENTINEL_NAME
-    stream = None
-    created = False
-    try:
-        stream = sentinel.open("x", encoding="utf-8", newline="\n")
-        created = True
-        try:
-            os.fchmod(stream.fileno(), stat.S_IRUSR | stat.S_IWUSR)
-        except (AttributeError, OSError):
-            pass
-        stream.write(CDP_PROFILE_SENTINEL_VALUE)
-        stream.flush()
-        os.fsync(stream.fileno())
-    except BaseException:  # noqa: BLE001 - clean an only-partially-written marker.
-        if stream is not None:
-            try:
-                stream.close()
-            except OSError:
-                pass
-        if created:
-            try:
-                sentinel.unlink()
-            except FileNotFoundError:
-                pass
-        raise
-    else:
-        stream.close()
-    return profile
 
 
 def _same_profile_directory(path: Path, expected: os.stat_result) -> bool:
@@ -173,26 +124,25 @@ def cleanup_cdp_profile(directory: str) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Initialize or safely remove a dedicated private CDP profile"
+    parser = JsonArgumentParser(
+        description="Safely remove a legacy dedicated CDP profile"
     )
     parser.add_argument("--directory", required=True)
     parser.add_argument(
         "--cleanup",
         action="store_true",
+        required=True,
         help="remove the exact initialized profile after dedicated Chrome stops",
     )
     return parser
 
 
+@sigterm_cancellable
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    action = "remove" if args.cleanup else "initialize"
+    action = "remove"
     try:
-        if args.cleanup:
-            cleanup_cdp_profile(args.directory)
-        else:
-            initialize_cdp_profile(args.directory)
+        cleanup_cdp_profile(args.directory)
     except (KeyboardInterrupt, asyncio.CancelledError) as exc:
         print(
             json.dumps(
@@ -219,13 +169,7 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": False,
                     "error": error,
                     "profile": {
-                        "status": (
-                            "not-established"
-                            if uncertain
-                            else "not-removed"
-                            if args.cleanup
-                            else "not-initialized"
-                        )
+                        "status": "not-established" if uncertain else "not-removed"
                     },
                     "cleanup": (
                         {
@@ -240,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 2
-    status = "removed" if args.cleanup else "initialized-empty-private"
+    status = "removed"
     print(
         json.dumps(
             {

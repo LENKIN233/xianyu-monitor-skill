@@ -27,9 +27,8 @@ be used only to resolve that absolute path.
   the exact task-file path and every exact login-state path the job will read.
   Scope that authorization to Xianyu search and monitoring only.
 - Never print, summarize, transmit, or commit cookies or proxy credentials.
-- Treat a CDP user-data directory as credential-bearing browser access. Use it
-  only after the user authorizes that exact path, and only for a dedicated,
-  private, temporary profile. Never attach to a daily/default browser profile.
+- Never expose Chrome through raw TCP CDP or attach to a daily/default browser
+  profile. Use `cdp_profile.py` only to clean an exact legacy temporary profile.
 - Prefer `--cookie-stdin` over command-line cookie values.
 - Prefer a user-private `--proxy-file` or scheduler-injected `XIANYU_PROXY` over
   credentialed `--proxy` arguments.
@@ -72,8 +71,9 @@ If bundled Chromium is unavailable but local Chrome is installed, pass
 
 Prefer the bundled dedicated login flow. It opens a separate visible browser;
 the user must complete login, OTP, QR, and CAPTCHA interactions themselves.
-They must also open the account area and visibly confirm that it is the intended
-account:
+After scanning a QR code, they may still need to approve the login on the phone;
+the QR disappearing does not mean login is complete. Wait for a normal Goofish
+page before the user submits final confirmation:
 
 ```bash
 python scripts/login_state.py \
@@ -83,60 +83,25 @@ python scripts/login_state.py \
 
 `--browser-channel chrome` selects the Chrome executable; it does not reuse an
 already-open Chrome session or profile. The user must log in inside the new
-window opened by this command.
+window opened by this command. The default login window is 1800 seconds; use
+`--timeout` only when an explicit different limit is needed.
 
-If a sandbox cannot launch Chrome, have the user start Chrome outside the
-sandbox with a newly created `0700` user-data directory and
-`--remote-debugging-port=0`. Then connect only to that exact directory:
+Do not connect this skill to an externally launched Chrome TCP debugging port.
+Chrome's local TCP CDP endpoint has no client authentication, so another local
+process in the network namespace may discover it and take over the logged-in
+context. The legacy `--cdp-user-data-dir` flag is hidden only for upgrade
+compatibility; supplying it returns structured `ArgumentError` JSON with exit
+`2` and never connects.
 
-```bash
-# macOS, in the user's normal Terminal
-cdp_profile="$(mktemp -d /private/tmp/xianyu-cdp.XXXXXX)"
-chmod 700 "$cdp_profile"
-python scripts/cdp_profile.py --directory "$cdp_profile"
-open -na "Google Chrome" --args \
-  --user-data-dir="$cdp_profile" \
-  --remote-debugging-port=0 \
-  --enable-automation \
-  --no-first-run \
-  --no-default-browser-check \
-  "https://www.goofish.com/"
-```
+If a sandbox cannot launch a browser, run the complete login, search, and
+monitor workflow on the trusted browser-owning host with
+`--browser-channel chrome`. Configure only the exact `0600` state-file path in
+that host's task or scheduler. A sandboxed agent may consume listing JSON, but
+must not receive the browser profile or state contents.
 
-The exact absolute path printed or chosen in that terminal must be passed
-privately into the sandbox; a shell variable does not cross process or sandbox
-boundaries. The fallback works only when both environments share that path,
-the same user identity, and the host loopback namespace. Then run:
-
-```bash
-python scripts/login_state.py \
-  --cdp-user-data-dir /private/tmp/xianyu-cdp.EXACT \
-  --confirm-in-browser \
-  --output /absolute/private/path/xianyu-state.json
-```
-
-The initializer accepts only an empty directory under an operating-system
-temporary root and adds the required dedicated profile sentinel before Chrome
-starts. The login/search commands read only that
-sentinel and `DevToolsActivePort` before connecting over loopback. They reject
-known default Chrome locations and user-controlled symlink components. A
-standard operating-system temp-root alias such as macOS `/var` to
-`/private/var` is accepted. They then ask Chrome over CDP for its launch command
-and require the exact approved `--user-data-dir` immediately after Playwright
-connects and before this skill reads default-context storage or creates a search
-context. The CDP transport may enumerate target
-metadata while connecting, so the approved profile path remains credential-
-bearing. `--enable-automation` is required for the command-line proof.
-On POSIX it also requires current-user ownership and no group/other permissions.
-On Windows, place the profile under the `Temp` child of the LocalAppData Known
-Folder and restrict it with the user's NTFS ACL; the CLI cannot verify that ACL.
-In `--confirm-in-browser` mode, release browser
-control and wait
-while the user personally logs in, verifies the account, and types the visible
-one-time code into the local-only confirmation page. Never inspect, fill, click,
-or solve that confirmation page for the user. The connected Chrome remains
-user-owned. After the state-backed smoke test, have the user close that Chrome,
-then remove only the guarded exact profile:
+When upgrading from a CDP-capable release, close any legacy dedicated Chrome.
+If its initialized temporary profile remains, use `cdp_profile.py` only for
+guarded migration cleanup:
 
 ```bash
 python scripts/cdp_profile.py \
@@ -144,34 +109,34 @@ python scripts/cdp_profile.py \
   --cleanup
 ```
 
-Cleanup refuses an uninitialized/non-temporary directory, detected Chrome
-activity indicators, a still-listening debugging endpoint, or a platform
-without symlink-safe recursive removal. Concurrent launch is not safely
-supported: keep the close/check/cleanup sequence strictly serial and never
-relaunch that profile during cleanup. If automatic cleanup is unavailable, have the user
-move that exact directory to the operating-system Trash/File Manager. Never
-substitute a broad recursive-delete command.
+The command no longer initializes profiles and requires `--cleanup`. It refuses
+a non-legacy/non-temporary directory, detected Chrome activity, a still-listening
+legacy debugging endpoint, or unsafe recursive removal. Keep close and cleanup
+strictly serial; never substitute a broad recursive-delete command.
 
 In the default confirmation mode, the command displays a one-time `SAVE-...`
 confirmation in the interactive terminal. When it appears, the agent must pause
 and wait for the user to provide that exact confirmation; the agent must never
 type, pipe, infer, or reuse it for the user. Non-interactive input, EOF, or a
 wrong token fail without saving. `--confirm-in-browser` moves the same deliberate
-confirmation into the local-only page described above and is the only mode that
-permits non-interactive command input. A login/challenge page, a missing
-navigation display-name field, or no retained Goofish browser-storage material
-also fails without saving.
+confirmation into a local-only page opened by this command and is the only mode that
+permits non-interactive command input.
 
-After confirmation, the command opens a fresh validation page and checks for
-the current PC navigation response's nonempty display-name field. Xianyu's
-current layout uses that field as a candidate session signal, but it is an
-undocumented candidate signal, not identity proof. The value is processed only in memory and
-is not emitted or separately copied by the command. Before saving, the command
-removes all non-Goofish Cookies and origins. The remaining site-created state
-is still a credential and may encode account data, so never inspect, summarize,
-or share it. It writes with `0600` permissions where supported and refuses to
-overwrite unless `--force` is explicit. A newly created containing directory
-uses `0700`; a final output symlink is rejected.
+Save a candidate only after all required gates pass: final user confirmation,
+the original tab is a normal HTTPS Goofish page rather than a login/challenge
+page, and the filtered Goofish storage state is nonempty. Only after final
+confirmation, open a fresh validation page and spend at most 15 seconds
+best-effort observing the current PC navigation response's nonempty
+`displayName`. This optional signal is neither an authentication nor identity
+proof, and its absence must not discard the candidate. Process it only in
+memory and never emit its value. An ordinary failure in this optional probe
+also degrades to `not-observed`; cancellation and cleanup failures remain
+terminal. Before saving, remove all non-Goofish Cookies
+and origins. The remaining site-created state is still a credential and may
+encode account data, so never inspect, summarize, or share it. Write with
+`0600` permissions where supported and refuse to overwrite unless `--force` is
+explicit. Use `0700` for a newly created containing directory and reject a final
+output symlink.
 
 Its output keeps evidence dimensions separate:
 
@@ -190,10 +155,13 @@ Its output keeps evidence dimensions separate:
   performed the confirmation.
 - `session.nav_display_name: present`: the current Goofish PC navigation
   response had a nonempty display-name field. This does not prove identity.
+- `session.nav_display_name: not-observed`: the optional signal was absent
+  during the best-effort observation; the candidate may still be saved.
 - `authentication.status: not-established`: the command did not prove that the
   candidate state is authenticated.
 - `identity.status: not-machine-verified`: the command did not verify which
-  account was visible.
+  account was visible even though the optional signal was observed. When it was
+  not observed, identity is `not-established`.
 - `search_capability.status: not-tested`: no search was run.
 - `cleanup.status`: `failed` contains generic cleanup errors and means the
   dedicated browser may not have fully exited; otherwise it is
@@ -204,11 +172,14 @@ user personally sends the exact token. If the user says they did not confirm,
 or the agent entered the token, treat the output and any resulting file as
 anomalous: do not use it or infer login, identity, or search capability.
 
-A later successful controlled search proves only that the browser context could
-search during that run. It never identifies the account. `RGV587` proves only
-that a request was rejected. Browser cleanup or local persistence can still
-fail after a successful search; rely on the independent capability field, not
-`ok` alone. Never promote any of these outcomes into an identity claim.
+After saving a candidate, run a real controlled search and require
+`search_capability.status: passed-for-this-run`; login capture success alone is
+not capability validation. A passing search proves only that the browser
+context could search during that run. It proves neither authentication nor
+identity. `RGV587` proves only that a request was rejected. Browser cleanup or
+local persistence can still fail after a successful search; rely on the
+independent capability field, not `ok` alone. Never promote any of these
+outcomes into an authentication or identity claim.
 
 A Playwright storage-state file exported from another browser tool is also
 supported, including the original `ai-goofish-monitor` extension's standard and
@@ -251,11 +222,6 @@ python scripts/spider.py \
   --state /absolute/private/path/xianyu-state.json
 ```
 
-When the sandbox also cannot launch the search browser, keep the dedicated CDP
-Chrome open and add
-`--cdp-user-data-dir /private/tmp/xianyu-cdp.EXACT`. This mode still
-requires `--state`; it never treats the connected profile itself as implicit
-authorization or as a replacement for the filtered state file.
 For a literal one-attempt smoke test, also pass `--pages 1 --retries 1`.
 
 The command captures only the exact Xianyu search endpoint, advances using the
@@ -276,6 +242,13 @@ authenticated.
 If a supplied candidate state reaches `/search` but no search API is observed
 in headless mode, retry once with `--headed`. Do not loop headed attempts or
 use anti-detection workarounds.
+
+Treat `SearchTransportError` as a transient intercepted-response failure; it
+uses the configured retry count. Do not retry `SearchCaptureError` or
+`SearchRejectedError` automatically. Public CLI parsing failures emit one
+`ArgumentError` JSON object on stdout and exit `2`. `SIGTERM` follows controlled
+cancellation and cleanup, emits cancellation JSON, and exits `130`. Require
+finite numeric prices; reject `NaN` and infinities.
 
 ## Analyze successful results
 
@@ -309,6 +282,10 @@ python scripts/task_manager.py \
 `--criteria` is an opaque analysis hint returned to an agent. The deterministic
 collector does not interpret natural language; only keyword, price, and
 location are enforced as search filters.
+
+Task files are schema-validated as a whole, including field types, unique IDs,
+bounded lists, and finite prices. If any entry is invalid, stop without
+rewriting the file; never silently discard an unknown or malformed task.
 
 Read `result.id` from successful create output. Use that ID to scope baseline
 and scheduling unless the user explicitly authorized every active task in the
@@ -399,9 +376,11 @@ operating-system scheduler.
 
 ## Troubleshoot
 
+- `SearchTransportError`: allow only the configured bounded retry loop; it
+  represents a transient intercepted-response transport failure.
 - `SearchCaptureError`: do not retry automatically. If a supplied candidate
   state reached `/search` in headless mode, make one explicit `--headed`
-  attempt. Malformed or intercepted API responses also use this error and
+  attempt. Missing or malformed captured API responses also use this error and
   should not be looped.
 - `SearchRejectedError`: stop automatic retries and report the rejection. For
   `RGV587`, let the request/session cool down; identity remains unknown. Do not

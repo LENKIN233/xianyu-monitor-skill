@@ -376,6 +376,26 @@ def test_nav_display_name_requires_success_and_nonempty_value() -> None:
     )
 
 
+def test_browser_confirmation_explains_scan_is_not_login_completion() -> None:
+    document = login_state._browser_confirmation_document(
+        "SAVE-1234",
+        "__confirm",
+    )
+
+    assert "扫码后还要在手机闲鱼中确认登录" in document
+    assert "二维码消失不代表登录已经完成" in document
+    assert "专用 Chrome 会自动关闭" in document
+    assert "SAVE-1234" in document
+
+
+def test_login_parser_allows_thirty_minutes_by_default() -> None:
+    args = login_state.build_parser().parse_args(
+        ["--output", str(Path.cwd() / "state.json")]
+    )
+
+    assert args.timeout == 1_800
+
+
 def test_storage_state_filter_removes_non_goofish_cookies_and_origins() -> None:
     state = {
         "cookies": [
@@ -584,144 +604,26 @@ def _install_fake_browser(
     )
 
 
-def test_cdp_capture_uses_default_context_and_disconnects(
+def test_cdp_capture_is_rejected_before_browser_or_output_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    events: list[str] = []
-    profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-    state = {
-        "cookies": [
-            {
-                "name": "cookie2",
-                "value": "SYNTHETIC",
-                "domain": ".goofish.com",
-                "path": "/",
-            }
-        ],
-        "origins": [],
-    }
-    context = FakeContext(events, state)
+    def unexpected_playwright() -> None:
+        pytest.fail("disabled CDP must fail before Playwright starts")
 
-    class ConnectedBrowser:
-        contexts = [context]
+    monkeypatch.setattr(login_state, "sync_playwright", unexpected_playwright)
 
-        def new_browser_cdp_session(self) -> Any:
-            class Session:
-                def send(self, method: str) -> dict[str, Any]:
-                    assert method == "Browser.getBrowserCommandLine"
-                    return {"arguments": [f"--user-data-dir={profile}"]}
-
-                def detach(self) -> None:
-                    events.append("session-detach")
-
-            return Session()
-
-        def new_context(self, **_kwargs: Any) -> FakeContext:
-            raise AssertionError("CDP capture must use the default context")
-
-        def close(self) -> None:
-            events.append("browser-disconnect")
-
-    class Chromium:
-        def connect_over_cdp(self, endpoint: str, **kwargs: Any) -> ConnectedBrowser:
-            assert endpoint.startswith("ws://127.0.0.1:")
-            assert kwargs["timeout"] == 5000
-            events.append("browser-connect")
-            return ConnectedBrowser()
-
-        def launch(self, **_kwargs: Any) -> ConnectedBrowser:
-            raise AssertionError("CDP capture must not launch a browser")
-
-    class Playwright:
-        chromium = Chromium()
-
-        def stop(self) -> None:
-            events.append("playwright-stop")
-
-    class Manager:
-        def start(self) -> Playwright:
-            return Playwright()
-
-    monkeypatch.setattr(login_state, "sync_playwright", Manager)
-    monkeypatch.setattr(
-        login_state,
-        "_private_cdp_profile_path",
-        lambda path: Path(path),
-    )
-    monkeypatch.setattr(
-        login_state,
-        "_cdp_endpoint_from_user_data_dir",
-        lambda _path: "ws://127.0.0.1:54321/devtools/browser/synthetic",
-    )
-    monkeypatch.setattr(
-        login_state,
-        "_read_explicit_confirmation",
-        lambda *_args, **_kwargs: events.append("user-confirmed"),
-    )
-
-    output = login_state.capture_login_state(
-        str(tmp_path / "state.json"),
-        browser_channel=None,
-        cdp_user_data_dir=str(profile),
-        timeout_seconds=5,
-        force=False,
-        input_stream=InteractiveInput(),
-        token_factory=lambda: "SAVE-1234",
-    )
-
-    assert output == tmp_path / "state.json"
-    assert "browser-connect" in events
-    assert "user-confirmed" in events
-    assert events[-3:] == [
-        "validation-close",
-        "browser-disconnect",
-        "playwright-stop",
-    ]
-
-
-def test_cdp_capture_rejects_output_inside_profile(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-    monkeypatch.setattr(
-        login_state,
-        "_private_cdp_profile_path",
-        lambda _path: profile,
-    )
-
-    with pytest.raises(ValueError, match="outside the CDP profile"):
+    with pytest.raises(ValueError, match="raw TCP CDP is disabled"):
         login_state.capture_login_state(
-            str(profile / "DevToolsActivePort"),
+            str(tmp_path / "state.json"),
             browser_channel=None,
-            cdp_user_data_dir=str(profile),
+            cdp_user_data_dir=str(tmp_path / "missing-profile"),
             timeout_seconds=5,
-            force=True,
+            force=False,
             input_stream=InteractiveInput(),
         )
 
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink coverage")
-def test_cdp_output_recheck_rejects_parent_replaced_during_capture(
-    tmp_path: Path,
-) -> None:
-    profile = tmp_path / "profile"
-    profile.mkdir(mode=0o700)
-    output_parent = tmp_path / "output"
-    output_parent.mkdir(mode=0o700)
-    output = login_state._credential_output_outside_profile(
-        str(output_parent / "state.json"),
-        profile,
-    )
-
-    output_parent.rename(tmp_path / "old-output")
-    output_parent.symlink_to(profile, target_is_directory=True)
-
-    with pytest.raises(ValueError, match="outside the CDP profile"):
-        login_state._credential_output_outside_profile(str(output), profile)
+    assert not (tmp_path / "state.json").exists()
 
 
 def test_browser_confirmation_allows_non_tty_capture(
@@ -934,7 +836,7 @@ def test_confirmation_without_session_material_does_not_write(
     assert not (tmp_path / "state.json").exists()
 
 
-def test_missing_nav_display_name_never_reads_or_writes_state(
+def test_missing_nav_display_name_still_saves_explicit_candidate_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -957,23 +859,139 @@ def test_missing_nav_display_name_never_reads_or_writes_state(
         lambda *_args, **_kwargs: events.append("user-confirmed"),
     )
 
-    def reject_marker(*_args: Any, **_kwargs: Any) -> None:
-        events.append("marker-rejected")
-        raise ValueError("navigation display name was not observed")
+    def miss_marker(*_args: Any, **_kwargs: Any) -> bool:
+        events.append("marker-not-observed")
+        return False
 
-    monkeypatch.setattr(login_state, "_require_nav_display_name", reject_marker)
+    monkeypatch.setattr(login_state, "_check_nav_display_name", miss_marker)
+    progress = login_state.CaptureProgress()
 
-    with pytest.raises(ValueError, match="display name was not observed"):
-        login_state.capture_login_state(
-            str(tmp_path / "state.json"),
-            browser_channel=None,
-            timeout_seconds=5,
-            force=False,
-            input_stream=InteractiveInput(),
-        )
+    output = login_state.capture_login_state(
+        str(tmp_path / "state.json"),
+        browser_channel=None,
+        timeout_seconds=5,
+        force=False,
+        input_stream=InteractiveInput(),
+        progress=progress,
+    )
 
-    assert "storage-state" not in events
-    assert not (tmp_path / "state.json").exists()
+    assert output == tmp_path / "state.json"
+    assert "storage-state" in events
+    assert progress.nav_display_name_checked is True
+    assert progress.nav_display_name_present is False
+    assert progress.state_saved is True
+
+
+@pytest.mark.parametrize(
+    "probe_error",
+    [
+        TimeoutError("optional navigation probe timed out"),
+        login_state.PlaywrightError("optional navigation probe failed"),
+        ValueError("optional navigation response changed"),
+    ],
+)
+def test_optional_nav_probe_error_still_saves_candidate_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_error: Exception,
+) -> None:
+    events: list[str] = []
+    state = {
+        "cookies": [
+            {
+                "name": "candidate",
+                "value": "SYNTHETIC",
+                "domain": ".goofish.com",
+                "path": "/",
+            }
+        ],
+        "origins": [],
+    }
+    _install_fake_browser(monkeypatch, events, state)
+    monkeypatch.setattr(
+        login_state,
+        "_read_explicit_confirmation",
+        lambda *_args, **_kwargs: events.append("user-confirmed"),
+    )
+
+    def fail_probe(*_args: Any, **_kwargs: Any) -> bool:
+        raise probe_error
+
+    monkeypatch.setattr(login_state, "_check_nav_display_name", fail_probe)
+    progress = login_state.CaptureProgress()
+
+    output = login_state.capture_login_state(
+        str(tmp_path / "state.json"),
+        browser_channel=None,
+        timeout_seconds=5,
+        force=False,
+        input_stream=InteractiveInput(),
+        progress=progress,
+    )
+
+    assert output == tmp_path / "state.json"
+    assert progress.nav_display_name_checked is True
+    assert progress.nav_display_name_present is False
+    assert progress.state_saved is True
+    assert events[-3:] == ["storage-state", "browser-close", "playwright-stop"]
+
+
+def test_optional_nav_page_creation_error_still_saves_candidate_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    state = {
+        "cookies": [
+            {
+                "name": "candidate",
+                "value": "SYNTHETIC",
+                "domain": ".goofish.com",
+                "path": "/",
+            }
+        ],
+        "origins": [],
+    }
+
+    class ValidationPageFailingContext(FakeContext):
+        page_calls = 0
+
+        def new_page(self) -> FakePage:
+            self.page_calls += 1
+            if self.page_calls == 2:
+                raise login_state.PlaywrightError(
+                    "optional validation page could not be created"
+                )
+            return super().new_page()
+
+    context = ValidationPageFailingContext(events, state)
+    browser = FakeBrowser(context, events)
+    monkeypatch.setattr(
+        login_state,
+        "sync_playwright",
+        lambda: FakePlaywrightManager(browser, events),
+    )
+    monkeypatch.setattr(
+        login_state,
+        "_read_explicit_confirmation",
+        lambda *_args, **_kwargs: events.append("user-confirmed"),
+    )
+    progress = login_state.CaptureProgress()
+
+    output = login_state.capture_login_state(
+        str(tmp_path / "state.json"),
+        browser_channel=None,
+        timeout_seconds=5,
+        force=False,
+        input_stream=InteractiveInput(),
+        progress=progress,
+    )
+
+    assert output == tmp_path / "state.json"
+    assert progress.nav_display_name_checked is True
+    assert progress.nav_display_name_present is False
+    assert progress.state_saved is True
+    assert events[-3:] == ["storage-state", "browser-close", "playwright-stop"]
 
 
 def test_close_failure_reports_candidate_file_as_saved(
@@ -1332,6 +1350,34 @@ def test_success_output_separates_state_identity_and_search(
     assert "IDENTITY_SENTINEL" not in captured.out
 
 
+def test_success_output_allows_optional_nav_signal_to_be_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "state.json"
+
+    def succeed(*_args: Any, **kwargs: Any) -> Path:
+        progress = kwargs["progress"]
+        progress.confirmation_received = True
+        progress.nav_display_name_checked = True
+        progress.saved_output = output
+        progress.state_saved = True
+        return output
+
+    monkeypatch.setattr(login_state, "capture_login_state", succeed)
+    monkeypatch.setattr(login_state.sys, "stdin", InteractiveInput())
+
+    assert login_state.main(["--output", str(output)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["state"] == {"status": "candidate-saved"}
+    assert payload["session"] == {"nav_display_name": "not-observed"}
+    assert payload["authentication"] == {"status": "not-established"}
+    assert payload["identity"] == {"status": "not-established"}
+    assert payload["search_capability"] == {"status": "not-tested"}
+
+
 def test_main_non_tty_reports_no_saved_state_without_starting_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1358,61 +1404,40 @@ def test_main_non_tty_reports_no_saved_state_without_starting_capture(
     assert str(tmp_path) not in json.dumps(template)
     assert template[-2:] == [
         "--timeout",
-        "600",
+        "1800",
     ]
     assert payload["authentication"]["status"] == "not-established"
     assert payload["identity"]["status"] == "not-established"
     assert payload["search_capability"]["status"] == "not-tested"
 
 
-def test_main_non_tty_browser_confirmation_forwards_cdp_options(
+def test_main_rejects_cdp_before_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    output = tmp_path / "state.json"
-    recorded: dict[str, Any] = {}
+    def unexpected_capture(*_args: Any, **_kwargs: Any) -> Path:
+        pytest.fail("disabled CDP must fail during argument parsing")
 
-    def succeed(*_args: Any, **kwargs: Any) -> Path:
-        recorded.update(kwargs)
-        progress = kwargs["progress"]
-        progress.confirmation_received = True
-        progress.confirmation_channel = "browser"
-        progress.nav_display_name_present = True
-        progress.saved_output = output
-        progress.state_saved = True
-        return output
+    monkeypatch.setattr(login_state, "capture_login_state", unexpected_capture)
 
-    monkeypatch.setattr(login_state, "capture_login_state", succeed)
-    monkeypatch.setattr(login_state.sys, "stdin", io.StringIO())
-    monkeypatch.setenv("XIANYU_BROWSER_CHANNEL", "chrome")
-
-    assert (
+    with pytest.raises(SystemExit) as captured:
         login_state.main(
             [
                 "--output",
-                str(output),
+                str(tmp_path / "state.json"),
                 "--cdp-user-data-dir",
                 str(tmp_path / "profile"),
                 "--confirm-in-browser",
-                "--timeout",
-                "17",
             ]
         )
-        == 0
-    )
-    captured = capsys.readouterr()
-    payload = json.loads(captured.out)
-    opening = json.loads(captured.err)
 
-    assert recorded["browser_channel"] is None
-    assert recorded["cdp_user_data_dir"] == str(tmp_path / "profile")
-    assert recorded["confirm_in_browser"] is True
-    assert recorded["timeout_seconds"] == 17
-    assert opening["browser_mode"] == "connected-dedicated-profile"
-    assert opening["confirmation_channel"] == "browser"
-    assert "output" not in opening
-    assert payload["confirmation"]["channel"] == "browser"
+    assert captured.value.code == 2
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    assert "raw TCP CDP is disabled" in payload["error"]
+    assert str(tmp_path / "profile") not in output.out
+    assert output.err == ""
 
 
 def test_main_preserves_missing_playwright_install_guidance(
@@ -1560,7 +1585,8 @@ def test_cancellation_between_opening_output_and_capture_is_structured(
 
     monkeypatch.setattr(login_state, "capture_login_state", capture_must_not_start)
     monkeypatch.setattr(login_state.sys, "stdin", InteractiveInput())
-    target_line = _function_line(login_state.main, "capture_login_state(")
+    main_implementation = inspect.unwrap(login_state.main)
+    target_line = _function_line(main_implementation, "capture_login_state(")
     previous_trace = sys.gettrace()
     triggered = False
 
@@ -1573,7 +1599,7 @@ def test_cancellation_between_opening_output_and_capture_is_structured(
         if (
             not triggered
             and event == "line"
-            and frame.f_code is login_state.main.__code__
+            and frame.f_code is main_implementation.__code__
             and frame.f_lineno == target_line
         ):
             triggered = True

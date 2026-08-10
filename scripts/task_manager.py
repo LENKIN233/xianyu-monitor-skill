@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import copy
 import json
+import math
 import os
 import stat
 import time
@@ -17,6 +18,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+if __package__:
+    from .cli_contract import JsonArgumentParser, sigterm_cancellable
+else:
+    from cli_contract import JsonArgumentParser, sigterm_cancellable
 
 SCHEMA_VERSION = 2
 MAX_SEEN_ITEMS = 50_000
@@ -29,6 +35,12 @@ TASK_COMMIT_STATUSES = {
     TASK_COMMIT_NOT_RECORDED,
     TASK_COMMIT_NOT_ESTABLISHED,
 }
+
+
+def _reject_nonfinite_json_constant(value: str) -> Any:
+    """Reject Python's non-standard NaN/Infinity JSON extensions."""
+
+    raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
 
 def _copy_mutation_evidence(
@@ -617,23 +629,140 @@ class TaskManager:
         normalized.pop("notification", None)
         return normalized
 
+    def _schema_error(self, detail: str) -> ValueError:
+        return ValueError(f"invalid task file schema: {self.data_file}: {detail}")
+
+    def _validate_loaded_task(
+        self,
+        task: dict[str, Any],
+        index: int,
+    ) -> dict[str, Any]:
+        location = f"tasks[{index}]"
+        for required in ("id", "keyword"):
+            if required not in task:
+                raise self._schema_error(f"{location}.{required} is required")
+        state_file = task.get("state_file")
+        if state_file is not None and not isinstance(state_file, str):
+            raise self._schema_error(f"{location}.state_file must be a string or null")
+
+        normalized = self._normalize_task(task)
+
+        for field_name in ("id", "keyword"):
+            value = normalized[field_name]
+            if not isinstance(value, str) or not value.strip():
+                raise self._schema_error(
+                    f"{location}.{field_name} must be a non-empty string"
+                )
+
+        for field_name in ("criteria",):
+            if not isinstance(normalized[field_name], str):
+                raise self._schema_error(f"{location}.{field_name} must be a string")
+
+        for field_name in ("location", "state_file", "last_run", "last_error"):
+            value = normalized[field_name]
+            if value is not None and not isinstance(value, str):
+                raise self._schema_error(
+                    f"{location}.{field_name} must be a string or null"
+                )
+
+        for field_name in ("created_at", "updated_at"):
+            value = normalized[field_name]
+            if not isinstance(value, str) or not value.strip():
+                raise self._schema_error(
+                    f"{location}.{field_name} must be a non-empty string"
+                )
+
+        if normalized["status"] not in {"running", "stopped"}:
+            raise self._schema_error(f"{location}.status must be running or stopped")
+
+        for field_name in ("pages", "retries"):
+            value = normalized[field_name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise self._schema_error(
+                    f"{location}.{field_name} must be an integer of at least 1"
+                )
+
+        results_count = normalized["results_count"]
+        if (
+            isinstance(results_count, bool)
+            or not isinstance(results_count, int)
+            or results_count < 0
+        ):
+            raise self._schema_error(
+                f"{location}.results_count must be a non-negative integer"
+            )
+
+        last_results = normalized["last_results"]
+        if not isinstance(last_results, list) or len(last_results) > MAX_LAST_RESULTS:
+            raise self._schema_error(
+                f"{location}.last_results must be a list of at most "
+                f"{MAX_LAST_RESULTS} objects"
+            )
+        if any(not isinstance(item, dict) for item in last_results):
+            raise self._schema_error(f"{location}.last_results entries must be objects")
+
+        seen_item_ids = normalized["seen_item_ids"]
+        if not isinstance(seen_item_ids, list) or len(seen_item_ids) > MAX_SEEN_ITEMS:
+            raise self._schema_error(
+                f"{location}.seen_item_ids must be a list of at most "
+                f"{MAX_SEEN_ITEMS} strings"
+            )
+        if any(
+            not isinstance(item_id, str) or not item_id for item_id in seen_item_ids
+        ):
+            raise self._schema_error(
+                f"{location}.seen_item_ids entries must be non-empty strings"
+            )
+
+        try:
+            self._validate_prices(
+                normalized["min_price"],
+                normalized["max_price"],
+            )
+        except ValueError as exc:
+            raise self._schema_error(f"{location}: {exc}") from exc
+
+        return normalized
+
     def _load(self) -> None:
         if not self.data_file.exists():
             self.tasks = []
             return
         try:
-            payload = json.loads(self.data_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            payload = json.loads(
+                self.data_file.read_text(encoding="utf-8"),
+                parse_constant=_reject_nonfinite_json_constant,
+            )
+        except (OSError, ValueError) as exc:
             raise ValueError(f"invalid task file {self.data_file}: {exc}") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
             raise ValueError(  # noqa: TRY004 - invalid persisted data is a value error.
                 f"invalid task file schema: {self.data_file}"
             )
-        self.tasks = [
-            self._normalize_task(task)
-            for task in payload["tasks"]
-            if isinstance(task, dict)
-        ]
+        schema_version = payload.get("schema_version", 1)
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version not in {1, SCHEMA_VERSION}
+        ):
+            raise self._schema_error(f"schema_version must be 1 or {SCHEMA_VERSION}")
+        if "updated_at" in payload:
+            updated_at = payload["updated_at"]
+            if not isinstance(updated_at, str) or not updated_at.strip():
+                raise self._schema_error("updated_at must be a non-empty string")
+
+        normalized_tasks: list[dict[str, Any]] = []
+        task_ids: set[str] = set()
+        for index, task in enumerate(payload["tasks"]):
+            if not isinstance(task, dict):
+                raise self._schema_error(f"tasks[{index}] must be an object")
+            normalized = self._validate_loaded_task(task, index)
+            task_id = normalized["id"]
+            if task_id in task_ids:
+                raise self._schema_error(f"duplicate task id: {task_id}")
+            task_ids.add(task_id)
+            normalized_tasks.append(normalized)
+        self.tasks = normalized_tasks
 
     def _save(self, *, on_commit: Callable[[], None] | None = None) -> None:
         payload = {
@@ -678,7 +807,13 @@ class TaskManager:
                 raise OSError(  # noqa: TRY301 - outer block owns cleanup.
                     "task staging identity was not established"
                 )
-            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            json.dump(
+                payload,
+                stream,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -818,6 +953,15 @@ class TaskManager:
 
     @staticmethod
     def _validate_prices(min_price: float | None, max_price: float | None) -> None:
+        for label, value in (("minimum", min_price), ("maximum", max_price)):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(  # noqa: TRY004 - public input contract uses ValueError.
+                    f"{label} price must be a number"
+                )
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{label} price must be finite")
         if min_price is not None and min_price < 0:
             raise ValueError("minimum price must not be negative")
         if max_price is not None and max_price < 0:
@@ -1082,7 +1226,7 @@ class TaskManager:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage Xianyu monitor tasks")
+    parser = JsonArgumentParser(description="Manage Xianyu monitor tasks")
     parser.add_argument("--data-file", default="tasks.json")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1160,6 +1304,7 @@ def _command_mutation_evidence(
     return report
 
 
+@sigterm_cancellable
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     mutation_progress: TaskMutationProgress | None = None
@@ -1224,6 +1369,7 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 ensure_ascii=True,
                 indent=2,
+                allow_nan=False,
             )
         )
     except TaskMutationInterrupted as exc:
@@ -1234,7 +1380,7 @@ def main(argv: list[str] | None = None) -> int:
             "error_type": type(cause).__name__,
             **_command_mutation_evidence(args, mutation_progress, exc),
         }
-        print(json.dumps(report, ensure_ascii=True))
+        print(json.dumps(report, ensure_ascii=True, allow_nan=False))
         return 130
     except (KeyboardInterrupt, asyncio.CancelledError) as exc:
         report = {
@@ -1243,7 +1389,7 @@ def main(argv: list[str] | None = None) -> int:
             "error_type": type(exc).__name__,
             **_command_mutation_evidence(args, mutation_progress, exc),
         }
-        print(json.dumps(report, ensure_ascii=True))
+        print(json.dumps(report, ensure_ascii=True, allow_nan=False))
         return 130
     except TaskMutationPersistenceError as exc:
         cause = getattr(exc, "cause_error", exc)
@@ -1253,7 +1399,7 @@ def main(argv: list[str] | None = None) -> int:
             "error_type": type(cause).__name__,
             **_command_mutation_evidence(args, mutation_progress, exc),
         }
-        print(json.dumps(report, ensure_ascii=True))
+        print(json.dumps(report, ensure_ascii=True, allow_nan=False))
         return 2
     except (KeyError, OSError, TimeoutError, ValueError) as exc:
         report = {
@@ -1270,7 +1416,7 @@ def main(argv: list[str] | None = None) -> int:
                     exc,
                 )
             )
-        print(json.dumps(report, ensure_ascii=True))
+        print(json.dumps(report, ensure_ascii=True, allow_nan=False))
         return 2
 
     return 0

@@ -33,28 +33,34 @@ except ImportError:
     sync_playwright = None
 
 if __package__:
+    from .cli_contract import (
+        RAW_CDP_DISABLED_MESSAGE,
+        JsonArgumentParser,
+        reject_raw_cdp_path,
+        sigterm_cancellable,
+    )
     from .create_state import _credential_output_path, _secure_write_json
     from .spider import (
         BASE_URL,
         DependencyError,
-        _cdp_endpoint_from_user_data_dir,
-        _command_line_uses_profile,
         _filter_goofish_storage_state,
         _has_storage_state_material,
-        _private_cdp_profile_path,
         _resolve_browser_channel,
         _safe_page_location,
     )
 else:
+    from cli_contract import (
+        RAW_CDP_DISABLED_MESSAGE,
+        JsonArgumentParser,
+        reject_raw_cdp_path,
+        sigterm_cancellable,
+    )
     from create_state import _credential_output_path, _secure_write_json
     from spider import (
         BASE_URL,
         DependencyError,
-        _cdp_endpoint_from_user_data_dir,
-        _command_line_uses_profile,
         _filter_goofish_storage_state,
         _has_storage_state_material,
-        _private_cdp_profile_path,
         _resolve_browser_channel,
         _safe_page_location,
     )
@@ -74,6 +80,7 @@ BLOCKED_PAGE_MARKERS = ("captcha", "challenge", "login", "passport", "punish", "
 class CaptureProgress:
     confirmation_received: bool = False
     confirmation_channel: str = "terminal"
+    nav_display_name_checked: bool = False
     nav_display_name_present: bool = False
     state_saved: bool = False
     state_commit_status: str = "not-saved"
@@ -347,9 +354,10 @@ def _browser_confirmation_document(token: str, binding_name: str) -> str:
 <body>
   <main>
     <h1>确认保存闲鱼候选登录状态</h1>
-    <p class="note">先切换到闲鱼标签页。由你本人完成登录、
-      验证码或 CAPTCHA，打开账号区域核对预期账号。回到本页输入
-      下方确认码。</p>
+    <p class="note">先切换到闲鱼标签页。扫码后还要在手机闲鱼中确认登录；
+      二维码消失不代表登录已经完成。等待网页显示你的头像或昵称，再打开账号区域
+      核对预期账号。全部完成以后，最后回到本页输入下方确认码。验证和保存结束后，
+      本工具启动的专用 Chrome 会自动关闭，这是正常的安全清理。</p>
     <p><code>{visible_token}</code></p>
     <form id="confirmation-form">
       <label for="confirmation-input">确认码</label>
@@ -527,12 +535,12 @@ def _observe_nav_display_name(page: Any) -> threading.Event:
     return observed
 
 
-def _require_nav_display_name(
+def _check_nav_display_name(
     page: Any,
     observed: threading.Event,
     timeout_seconds: float,
-) -> None:
-    """Observe the current PC navigation display-name field, failing closed."""
+) -> bool:
+    """Best-effort check of the current PC navigation display-name field."""
 
     if timeout_seconds <= 0:
         raise TimeoutError("timed out before session-candidate validation")
@@ -549,11 +557,7 @@ def _require_nav_display_name(
     deadline = time.monotonic() + min(timeout_seconds, 15)
     while not observed.is_set() and time.monotonic() < deadline:
         page.wait_for_timeout(100)
-    if not observed.is_set():
-        raise ValueError(
-            "Xianyu navigation display name was not observed; "
-            "browser state was not saved"
-        )
+    return observed.is_set()
 
 
 def _cleanup_preserving_primary_error(
@@ -597,43 +601,6 @@ def _cleanup_interrupted_playwright_start(
             raise
 
 
-def _verify_sync_cdp_profile(browser: Any, expected_profile: Path) -> None:
-    """Fail closed unless Chrome proves which user-data directory it uses."""
-
-    session: Any | None = None
-    try:
-        session = browser.new_browser_cdp_session()
-        payload = session.send("Browser.getBrowserCommandLine")
-    except (AttributeError, PlaywrightError) as exc:
-        raise ValueError(
-            "connected Chrome could not prove its dedicated user-data directory; "
-            "restart it with --enable-automation"
-        ) from exc
-    finally:
-        if session is not None:
-            try:
-                session.detach()
-            except PlaywrightError:
-                pass
-    arguments = payload.get("arguments") if isinstance(payload, dict) else None
-    if not _command_line_uses_profile(arguments, expected_profile):
-        raise ValueError(
-            "connected Chrome did not use the approved dedicated user-data directory"
-        )
-
-
-def _credential_output_outside_profile(
-    output_file: str,
-    cdp_profile: Path | None,
-) -> Path:
-    output = _credential_output_path(output_file)
-    if cdp_profile is not None and (
-        output == cdp_profile or output.is_relative_to(cdp_profile)
-    ):
-        raise ValueError("login-state output must be outside the CDP profile")
-    return output
-
-
 def capture_login_state(
     output_file: str,
     *,
@@ -647,6 +614,8 @@ def capture_login_state(
     token_factory: Callable[[], str] = _new_confirmation_token,
     progress: CaptureProgress | None = None,
 ) -> Path:
+    if cdp_user_data_dir:
+        raise ValueError(RAW_CDP_DISABLED_MESSAGE)
     if sync_playwright is None:
         raise DependencyError(
             "playwright is not installed; run: "
@@ -657,32 +626,18 @@ def capture_login_state(
     confirmation_input = input_stream if input_stream is not None else sys.stdin
     confirmation_errors = error_stream if error_stream is not None else sys.stderr
     capture_progress = progress if progress is not None else CaptureProgress()
-    if browser_channel and cdp_user_data_dir:
-        raise ValueError(
-            "--browser-channel and --cdp-user-data-dir are mutually exclusive"
-        )
     if not confirm_in_browser and not _is_interactive_stream(confirmation_input):
         raise ValueError(
             "interactive terminal required; the user must confirm personally"
         )
-    cdp_profile = (
-        _private_cdp_profile_path(cdp_user_data_dir) if cdp_user_data_dir else None
-    )
-    output = _credential_output_outside_profile(output_file, cdp_profile)
+    output = _credential_output_path(output_file)
     if output.is_symlink():
         raise ValueError(f"refusing to write login state through a symlink: {output}")
     if output.exists() and not force:
         raise FileExistsError(f"{output} already exists; pass --force to replace it")
-    cdp_endpoint = (
-        _cdp_endpoint_from_user_data_dir(str(cdp_profile))
-        if cdp_profile is not None
-        else None
-    )
-
     playwright_manager = sync_playwright()
     playwright: Any | None = None
     browser: Any | None = None
-    connected_page: Any | None = None
     try:
         try:
             playwright = playwright_manager.start()
@@ -696,40 +651,18 @@ def capture_login_state(
             )
             raise
 
-        if cdp_endpoint:
-            try:
-                browser = playwright.chromium.connect_over_cdp(
-                    cdp_endpoint,
-                    timeout=min(max(timeout_seconds * 1000, 1), 60_000),
-                )
-            except PlaywrightError as exc:
-                raise ValueError(
-                    "unable to connect to the dedicated local Chrome browser"
-                ) from exc
-            _verify_sync_cdp_profile(browser, cdp_profile)
-        else:
-            launch_kwargs: dict[str, Any] = {"headless": False}
-            if browser_channel:
-                launch_kwargs["channel"] = browser_channel
-            browser = playwright.chromium.launch(**launch_kwargs)
+        launch_kwargs: dict[str, Any] = {"headless": False}
+        if browser_channel:
+            launch_kwargs["channel"] = browser_channel
+        browser = playwright.chromium.launch(**launch_kwargs)
 
         if browser is not None:
-            if cdp_endpoint:
-                contexts = list(browser.contexts)
-                if len(contexts) != 1:
-                    raise ValueError(
-                        "dedicated CDP Chrome must expose exactly one browser context"
-                    )
-                context = contexts[0]
-            else:
-                context = browser.new_context(
-                    locale="zh-CN",
-                    timezone_id="Asia/Shanghai",
-                    viewport={"width": 1440, "height": 900},
-                )
+            context = browser.new_context(
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                viewport={"width": 1440, "height": 900},
+            )
             page = context.new_page()
-            if cdp_endpoint:
-                connected_page = page
             try:
                 page.goto(
                     BASE_URL,
@@ -769,21 +702,27 @@ def capture_login_state(
             # Attach only after explicit confirmation so the identity-bearing
             # response is not read before consent and cannot be a stale signal
             # from the initial anonymous/login page load.
-            validation_page = context.new_page()
+            capture_progress.nav_display_name_checked = True
+            validation_page: Any | None = None
             try:
+                validation_page = context.new_page()
                 nav_display_name = _observe_nav_display_name(validation_page)
-                _require_nav_display_name(
+                capture_progress.nav_display_name_present = _check_nav_display_name(
                     validation_page,
                     nav_display_name,
                     deadline - time.monotonic(),
                 )
-                capture_progress.nav_display_name_present = True
+            except (PlaywrightError, TimeoutError, ValueError):
+                # This undocumented signal is optional evidence. The required
+                # normal-page check already ran on the user-confirmed page.
+                capture_progress.nav_display_name_present = False
             finally:
-                _cleanup_preserving_primary_error(
-                    validation_page.close,
-                    "failed to close the validation page",
-                    capture_progress,
-                )
+                if validation_page is not None:
+                    _cleanup_preserving_primary_error(
+                        validation_page.close,
+                        "failed to close the validation page",
+                        capture_progress,
+                    )
             try:
                 raw_state = context.storage_state(indexed_db=True)
             except TypeError as exc:
@@ -804,10 +743,7 @@ def capture_login_state(
                 capture_progress.state_saved = True
                 capture_progress.state_commit_status = "candidate-saved"
 
-            current_output = _credential_output_outside_profile(
-                str(output),
-                cdp_profile,
-            )
+            current_output = _credential_output_path(str(output))
             if current_output != output:
                 raise ValueError("login-state output directory changed during capture")
             try:
@@ -841,31 +777,19 @@ def capture_login_state(
             return saved_output
     finally:
         try:
-            if connected_page is not None:
+            if browser is not None:
                 _cleanup_preserving_primary_error(
-                    connected_page.close,
-                    "failed to close the connected Xianyu page",
+                    browser.close,
+                    "failed to close the dedicated browser",
                     capture_progress,
                 )
         finally:
-            try:
-                if browser is not None:
-                    _cleanup_preserving_primary_error(
-                        browser.close,
-                        (
-                            "failed to disconnect from the connected browser"
-                            if cdp_endpoint
-                            else "failed to close the dedicated browser"
-                        ),
-                        capture_progress,
-                    )
-            finally:
-                if playwright is not None:
-                    _cleanup_preserving_primary_error(
-                        playwright.stop,
-                        "failed to stop the dedicated browser runtime",
-                        capture_progress,
-                    )
+            if playwright is not None:
+                _cleanup_preserving_primary_error(
+                    playwright.stop,
+                    "failed to stop the dedicated browser runtime",
+                    capture_progress,
+                )
 
 
 def _capture_evidence(progress: CaptureProgress) -> dict[str, Any]:
@@ -897,7 +821,11 @@ def _capture_evidence(progress: CaptureProgress) -> dict[str, Any]:
         },
         "session": {
             "nav_display_name": (
-                "present" if progress.nav_display_name_present else "not-established"
+                "present"
+                if progress.nav_display_name_present
+                else "not-observed"
+                if progress.nav_display_name_checked
+                else "not-established"
             )
         },
         "identity": {
@@ -921,16 +849,12 @@ def _capture_evidence(progress: CaptureProgress) -> dict[str, Any]:
 
 
 def _require_complete_capture(progress: CaptureProgress) -> None:
-    if not (
-        progress.confirmation_received
-        and progress.nav_display_name_present
-        and progress.state_saved
-    ):
+    if not (progress.confirmation_received and progress.state_saved):
         raise ValueError("capture completed without the required evidence")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = JsonArgumentParser(
         description=(
             "Open a visible Xianyu browser and save candidate state "
             "after interactive confirmation"
@@ -947,13 +871,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     browser_group.add_argument(
         "--cdp-user-data-dir",
-        help=(
-            "connect through DevToolsActivePort in an explicitly dedicated, "
-            "private Chrome user-data directory"
-        ),
+        type=reject_raw_cdp_path,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "--timeout", type=int, default=600, help="login timeout seconds"
+        "--timeout",
+        type=int,
+        default=1_800,
+        help="login timeout seconds (default: 1800)",
     )
     parser.add_argument(
         "--confirm-in-browser",
@@ -978,8 +903,6 @@ def _terminal_handoff_argv_template(args: argparse.Namespace) -> list[str]:
     ]
     if args.browser_channel:
         command.extend(["--browser-channel", args.browser_channel])
-    if args.cdp_user_data_dir:
-        command.extend(["--cdp-user-data-dir", "<DEDICATED_CDP_PROFILE_PATH>"])
     if args.force:
         command.append("--force")
     return command
@@ -987,7 +910,7 @@ def _terminal_handoff_argv_template(args: argparse.Namespace) -> list[str]:
 
 def _redact_private_paths(message: str, args: argparse.Namespace) -> str:
     candidates: set[str] = set()
-    for value in (args.output, args.cdp_user_data_dir):
+    for value in (args.output,):
         if not value:
             continue
         requested = Path(value).expanduser()
@@ -1020,12 +943,10 @@ def _safe_capture_error_message(exc: Exception, args: argparse.Namespace) -> str
     return _redact_private_paths(str(exc), args)
 
 
+@sigterm_cancellable
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    args.browser_channel = _resolve_browser_channel(
-        args.browser_channel,
-        args.cdp_user_data_dir,
-    )
+    args.browser_channel = _resolve_browser_channel(args.browser_channel)
     progress = CaptureProgress()
     try:
         if not args.confirm_in_browser and not _is_interactive_stream(sys.stdin):
@@ -1057,11 +978,7 @@ def main(argv: list[str] | None = None) -> int:
                     "confirmation_channel": (
                         "browser" if args.confirm_in_browser else "terminal"
                     ),
-                    "browser_mode": (
-                        "connected-dedicated-profile"
-                        if args.cdp_user_data_dir
-                        else "launched-dedicated-context"
-                    ),
+                    "browser_mode": "launched-dedicated-context",
                 },
                 ensure_ascii=True,
             ),
@@ -1073,7 +990,6 @@ def main(argv: list[str] | None = None) -> int:
             browser_channel=args.browser_channel,
             timeout_seconds=args.timeout,
             force=args.force,
-            cdp_user_data_dir=args.cdp_user_data_dir,
             confirm_in_browser=args.confirm_in_browser,
             progress=progress,
         )

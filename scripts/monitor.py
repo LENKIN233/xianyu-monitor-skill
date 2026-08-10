@@ -11,6 +11,21 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
+    from .cli_contract import (
+        RAW_CDP_DISABLED_MESSAGE,
+        JsonArgumentParser,
+        reject_raw_cdp_path,
+        sigterm_cancellable,
+    )
+else:
+    from cli_contract import (
+        RAW_CDP_DISABLED_MESSAGE,
+        JsonArgumentParser,
+        reject_raw_cdp_path,
+        sigterm_cancellable,
+    )
+
+if __package__:
     from .spider import (
         SearchCancelledError,
         SpiderError,
@@ -239,6 +254,8 @@ async def run_tasks(
     progress: MonitorRunProgress | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     run_progress = progress if progress is not None else MonitorRunProgress()
+    if getattr(args, "cdp_user_data_dir", None):
+        raise ValueError(RAW_CDP_DISABLED_MESSAGE)
     tasks_path = Path(args.tasks_file).expanduser()
     if not tasks_path.is_file():
         raise ValueError(f"task file does not exist: {tasks_path.resolve()}")
@@ -267,10 +284,8 @@ async def run_tasks(
             )
         prepared_tasks.append((task, state_file))
 
-    cdp_user_data_dir = getattr(args, "cdp_user_data_dir", None)
     browser_channel = _resolve_browser_channel(
         getattr(args, "browser_channel", None),
-        cdp_user_data_dir,
     )
     reports = run_progress.reports
     had_error = False
@@ -302,7 +317,6 @@ async def run_tasks(
                 proxy=proxy,
                 headless=not args.headed,
                 browser_channel=browser_channel,
-                cdp_user_data_dir=cdp_user_data_dir,
                 verbose=not getattr(args, "quiet_if_empty", False),
             )
             items = await spider.search(
@@ -593,7 +607,7 @@ async def run_tasks(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run Xianyu monitor tasks")
+    parser = JsonArgumentParser(description="Run Xianyu monitor tasks")
     parser.add_argument("--tasks-file", default="tasks.json")
     parser.add_argument("--task-id")
     parser.add_argument("--state", help="override task login-state path")
@@ -613,10 +627,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     browser_group.add_argument(
         "--cdp-user-data-dir",
-        help=(
-            "connect through a dedicated private Chrome profile; every selected "
-            "task must resolve an authorized state file"
-        ),
+        type=reject_raw_cdp_path,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--headed", action="store_true")
     output_group = parser.add_mutually_exclusive_group()
@@ -638,6 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@sigterm_cancellable
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     run_progress = MonitorRunProgress()
@@ -656,7 +669,7 @@ def main(argv: list[str] | None = None) -> int:
             and payload["new_count"] == 0
         )
         if not suppress_output:
-            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            print(json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False))
         # Keep success emission inside the cancellation evidence boundary.
         return 2 if had_error else 0  # noqa: TRY300
     except MonitorCancelledError as exc:
@@ -678,6 +691,7 @@ def main(argv: list[str] | None = None) -> int:
                     "cleanup": cleanup_evidence(exc),
                 },
                 ensure_ascii=True,
+                allow_nan=False,
             )
         )
         return 130
@@ -714,6 +728,7 @@ def main(argv: list[str] | None = None) -> int:
                     "cleanup": cleanup,
                 },
                 ensure_ascii=True,
+                allow_nan=False,
             )
         )
         return 130
@@ -733,6 +748,7 @@ def main(argv: list[str] | None = None) -> int:
                     "cleanup": cleanup_evidence(exc),
                 },
                 ensure_ascii=True,
+                allow_nan=False,
             )
         )
         return 2

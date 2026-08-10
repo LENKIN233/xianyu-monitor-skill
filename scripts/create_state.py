@@ -17,6 +17,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .cli_contract import JsonArgumentParser, sigterm_cancellable
+else:
+    from cli_contract import JsonArgumentParser, sigterm_cancellable
+
+_PRIVATE_CREDENTIAL_MODE = stat.S_IRUSR | stat.S_IWUSR
+_PRIVATE_DIRECTORY_MODE = stat.S_IRWXU
+
 
 @dataclass
 class CredentialWriteProgress:
@@ -139,17 +147,23 @@ def _same_credential_stage_directory(stage: _CredentialStage) -> bool:
 
 
 def _prepare_credential_stage(stage: _CredentialStage) -> None:
-    stage.directory.mkdir(mode=stat.S_IRWXU)
+    stage.directory.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
     directory_stat = stage.directory.lstat()
     if not stat.S_ISDIR(directory_stat.st_mode):
         raise OSError("private credential staging directory has an unexpected type")
     stage.directory_stat = directory_stat
     stage.stream = stage.path.open("x", encoding="utf-8", newline="\n")
     stage.file_stat = os.fstat(stage.stream.fileno())
-    try:
-        os.fchmod(stage.stream.fileno(), stat.S_IRUSR | stat.S_IWUSR)
-    except (AttributeError, OSError):
-        pass
+    if os.name != "nt":
+        os.fchmod(stage.stream.fileno(), _PRIVATE_CREDENTIAL_MODE)
+    secured_stat = os.fstat(stage.stream.fileno())
+    if not os.path.samestat(stage.file_stat, secured_stat):
+        raise OSError("private credential staging file changed while being secured")
+    _require_private_credential_metadata(
+        secured_stat,
+        description="private credential staging file",
+    )
+    stage.file_stat = secured_stat
 
 
 def _close_credential_stage_stream(stage: _CredentialStage) -> None:
@@ -282,6 +296,21 @@ def _same_staged_file(path: Path, expected: os.stat_result) -> bool:
     return stat.S_ISREG(actual.st_mode) and os.path.samestat(expected, actual)
 
 
+def _require_private_credential_metadata(
+    metadata: os.stat_result,
+    *,
+    description: str,
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError(f"{description} has an unexpected type")
+    if os.name == "nt":
+        return
+    if metadata.st_uid != os.geteuid():
+        raise OSError(f"{description} is not owned by the current user")
+    if stat.S_IMODE(metadata.st_mode) != _PRIVATE_CREDENTIAL_MODE:
+        raise OSError(f"{description} permissions are not 0600")
+
+
 def _unlink_staged_file(path: Path, expected: os.stat_result) -> None:
     """Remove a staging path only while it still names our staged inode."""
 
@@ -294,8 +323,20 @@ def _unlink_staged_file(path: Path, expected: os.stat_result) -> None:
 
 
 def _require_staged_output(path: Path, expected: os.stat_result | None) -> None:
-    if expected is None or not _same_staged_file(path, expected):
+    if expected is None:
         raise OSError("credential output changed before commit could be verified")
+    try:
+        actual = path.lstat()
+    except FileNotFoundError as exc:
+        raise OSError(
+            "credential output changed before commit could be verified"
+        ) from exc
+    if not stat.S_ISREG(actual.st_mode) or not os.path.samestat(expected, actual):
+        raise OSError("credential output changed before commit could be verified")
+    _require_private_credential_metadata(
+        actual,
+        description="credential output",
+    )
 
 
 def _secure_write_json(
@@ -312,11 +353,17 @@ def _secure_write_json(
         parent_created = True
     except FileExistsError:
         pass
-    if parent_created:
-        try:
-            output.parent.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-        except OSError:
-            pass
+    if parent_created and os.name != "nt":
+        output.parent.chmod(_PRIVATE_DIRECTORY_MODE)
+        parent_stat = output.parent.lstat()
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            raise OSError("credential output directory has an unexpected type")
+        if parent_stat.st_uid != os.geteuid():
+            raise OSError(
+                "credential output directory is not owned by the current user"
+            )
+        if stat.S_IMODE(parent_stat.st_mode) != _PRIVATE_DIRECTORY_MODE:
+            raise OSError("credential output directory permissions are not 0700")
     if output.is_symlink():
         raise ValueError(f"refusing to write login state through a symlink: {output}")
     if output.exists() and not force:
@@ -347,10 +394,19 @@ def _secure_write_json(
             output_stat = output.lstat()
         except FileNotFoundError:
             return False
-        return stat.S_ISREG(output_stat.st_mode) and os.path.samestat(
-            stage.file_stat,
-            output_stat,
-        )
+        if not stat.S_ISREG(output_stat.st_mode) or not os.path.samestat(
+            stage.file_stat, output_stat
+        ):
+            return False
+        try:
+            _require_private_credential_metadata(
+                output_stat,
+                description="credential output",
+            )
+        except OSError:
+            _unlink_staged_file(output, stage.file_stat)
+            return False
+        return True
 
     try:
         _prepare_credential_stage(stage)
@@ -359,11 +415,12 @@ def _secure_write_json(
             raise OSError(  # noqa: TRY301 - outer block owns cleanup.
                 "credential staging identity was not established"
             )
-        json.dump(payload, stream, ensure_ascii=False, indent=2)
+        json.dump(payload, stream, ensure_ascii=False, indent=2, allow_nan=False)
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
         _close_credential_stage_stream(stage)
+        _require_staged_output(stage.path, stage.file_stat)
 
         if force:
             publish_attempted = True
@@ -488,7 +545,7 @@ def _read_cookie_input(args: argparse.Namespace) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Create secure Playwright login state")
+    parser = JsonArgumentParser(description="Create secure Playwright login state")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--cookie-stdin", action="store_true")
     source.add_argument("--cookie-file")
@@ -498,6 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@sigterm_cancellable
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     progress = CredentialWriteProgress()
@@ -518,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
                     **_write_evidence(progress),
                 },
                 ensure_ascii=True,
+                allow_nan=False,
             )
         )
         return 0  # noqa: TRY300 - keep success emission inside cancellation boundary
@@ -532,6 +591,7 @@ def main(argv: list[str] | None = None) -> int:
                     **_write_evidence(progress),
                 },
                 ensure_ascii=True,
+                allow_nan=False,
             )
         )
         return 130
@@ -546,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
                     **_write_evidence(progress),
                 },
                 ensure_ascii=True,
+                allow_nan=False,
             )
         )
         return 2

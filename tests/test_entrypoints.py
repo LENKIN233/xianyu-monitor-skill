@@ -9,6 +9,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_runtime_contains_no_raw_cdp_attachment() -> None:
+    runtime = "\n".join(
+        (ROOT / "scripts" / name).read_text(encoding="utf-8")
+        for name in ("spider.py", "login_state.py", "monitor.py")
+    )
+
+    assert "connect_over_cdp" not in runtime
+
+
 def test_monitor_module_entrypoint_from_skill_root() -> None:
     result = subprocess.run(  # noqa: S603
         [sys.executable, "-m", "scripts.monitor", "--help"],
@@ -53,7 +62,7 @@ def test_login_state_script_help_from_foreign_working_directory(
 
     assert result.returncode == 0
     assert "--browser-channel" in result.stdout
-    assert "--cdp-user-data-dir" in result.stdout
+    assert "--cdp-user-data-dir" not in result.stdout
     assert "--confirm-in-browser" in result.stdout
 
 
