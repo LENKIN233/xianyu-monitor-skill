@@ -10,7 +10,7 @@ import os
 import stat
 import sys
 from collections.abc import Mapping, Sequence
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from typing import Any
 
 # Executing this read-only diagnostic must not leave local bytecode caches.
@@ -219,16 +219,11 @@ def _local_chrome_candidates(
         home_drive = environment.get("HOMEDRIVE")
         if home_drive:
             drive_name = home_drive.rstrip("\\/")
-            drive_root = PureWindowsPath(f"{drive_name}\\")
             for program_files in ("Program Files", "Program Files (x86)"):
                 candidates.append(
                     Path(
-                        drive_root
-                        / program_files
-                        / "Google"
-                        / "Chrome"
-                        / "Application"
-                        / "chrome.exe"
+                        f"{drive_name}/{program_files}/Google/Chrome/"
+                        "Application/chrome.exe"
                     )
                 )
         return candidates
