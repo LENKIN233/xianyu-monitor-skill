@@ -1,4 +1,4 @@
 interface:
-  display_name: "Xianyu Monitor"
-  short_description: "Search and monitor Xianyu listings safely"
-  default_prompt: "Use $xianyu-monitor to find and monitor Xianyu listings matching my criteria."
+  display_name: "Xianyu / 闲鱼 Monitor"
+  short_description: "Search and monitor Xianyu/Goofish safely"
+  default_prompt: "Use $xianyu-monitor to search or monitor Xianyu/Goofish listings matching my keyword, price, location, and schedule criteria."

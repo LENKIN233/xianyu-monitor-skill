@@ -1,6 +1,6 @@
 ---
 name: xianyu-monitor
-description: Search and monitor Xianyu listings with private browser state, filters, pagination, persistent tasks, and deduplication. Use to find or track listings.
+description: Search and monitor Xianyu/Goofish (闲鱼) listings with private browser state, keyword and price/location filters, real pagination, persistent tasks, and newly observed listing deduplication. Use when a user asks to 搜闲鱼、监控闲鱼上新、蹲二手商品、设置价格范围、find Goofish listings, or run recurring Xianyu searches from Codex, Claude Code, OpenClaw, or a CLI scheduler.
 ---
 
 # Xianyu Monitor

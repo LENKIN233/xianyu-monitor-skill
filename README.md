@@ -1,121 +1,112 @@
-# Xianyu Monitor Skill
+# Xianyu Monitor — 闲鱼搜索与监控 Agent Skill
 
-一个遵循 [Agent Skills 开放规范](https://agentskills.io/specification) 的闲鱼搜索与监控
-Skill。核心只依赖 Python、Playwright 和闲鱼浏览器状态，不依赖 OpenClaw、Codex、
-Claude Code 或任何特定调度器。
+[![CI](https://github.com/LENKIN233/xianyu-monitor-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/LENKIN233/xianyu-monitor-skill/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
+[![Agent Skills](https://img.shields.io/badge/Agent_Skills-compatible-5B5BD6.svg)](https://agentskills.io/specification)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-它可以作为：
+用本地私有浏览器状态搜索和持续监控闲鱼 / Goofish 商品，支持关键词、价格、地区、
+真实分页、持久任务和新观察商品去重。核心不依赖特定 Agent，可用于 Codex、
+Claude Code、OpenClaw 或普通 CLI/调度器。
 
-- Codex / ChatGPT 桌面端 Skill；
-- Claude Code Skill；
-- OpenClaw Skill；
-- 纯 CLI 工具；
-- `cron`、`systemd`、`launchd`、Windows Task Scheduler 等任务的一次性命令。
+Search and monitor Xianyu/Goofish listings with private local browser state.
+Works across Codex, Claude Code, OpenClaw, and CLI schedulers.
 
-> 本项目只负责搜索、过滤、去重和结构化输出，不会自动购买、联系卖家或替用户做
-> 真实性保证。
+## 一眼看懂
 
-## 核心能力
+| 能做 | 不会做 |
+|---|---|
+| 搜索商品，执行价格和地区过滤 | 绕过 CAPTCHA、登录挑战或平台风控 |
+| 真实翻页并按商品 ID 去重 | 自动联系卖家、购买、下单或付款 |
+| 保存任务，只返回新观察到的商品 | 凭空判断卖家信用、真假或维修历史 |
+| 输出稳定 JSON 供任意宿主投递 | 内置 AI 商品分析或通知渠道 |
 
-- 精确捕获闲鱼搜索 GET/POST 接口，避免误匹配其他接口。
-- 使用真实的下一页控件，不会重复抓取第一页。
-- 在本地严格执行价格和地区过滤。
-- 使用持久任务文件记录条件、运行结果与已见商品 ID。
-- 观察到登录跳转或挑战、风控和抓取失败会明确报错，不会伪装成“没有新商品”。
-- Cookie、任务文件采用原子写入；POSIX 使用 `0600`，Windows 依赖私有目录 ACL。
-- 代理日志隐藏用户名和密码。
-- HTTP(S) 认证代理可通过私有文件或 `XIANYU_PROXY` 注入，不必写入命令参数。
-- 输出稳定 JSON，便于任意 Agent 或调度器消费。
-- 成功且没有新商品时可用 `--quiet-if-empty` 保持无输出。
+失败、登录跳转和风险控制会明确返回错误，不会伪装成“没有商品”。Cookie、代理凭据和
+登录状态始终视为私密凭据；本项目不会把它们作为通知内容或提交到仓库。
 
-## 通用架构
+## 三步快速开始
 
-```text
-任意 Agent / CLI / 调度器
-          |
-          v
- scripts/monitor.py  ---> JSON / exit code ---> 任意通知渠道
-          |
-          +-- scripts/spider.py ---> Playwright ---> 闲鱼
-          |
-          +-- scripts/task_manager.py ---> tasks.json
-```
+需要 Python 3.10+。强烈建议把状态文件放在仓库之外的用户私有绝对路径；若确需放入
+checkout，只能使用已被整个目录忽略的私有目录。
 
-调度和消息投递属于宿主适配层，不进入爬虫、任务文件或 `SKILL.md` 核心流程。因此
-OpenClaw 可以继续使用，但不再是运行前提。
-
-## 安装
-
-需要 Python 3.10+。
+### 1. 安装
 
 ```bash
-git clone \
-  https://github.com/LENKIN233/xianyu-monitor-skill.git \
-  xianyu-monitor
+git clone https://github.com/LENKIN233/xianyu-monitor-skill.git xianyu-monitor
 cd xianyu-monitor
-
 python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-python -m playwright install chromium
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m playwright install chromium
 ```
 
-Windows PowerShell：
-
-```powershell
-py -3 -c "import sys; assert sys.version_info >= (3, 10), 'Python 3.10+ required'"
-py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m playwright install chromium
-```
-
-Windows 定时任务直接调用 `.\.venv\Scripts\python.exe`。运行所需的 IANA
-时区数据会由 `requirements.txt` 安装，因此精简 Linux 容器和 Windows 都不依赖
-系统时区包。后续示例中的反斜杠是 POSIX shell 换行；PowerShell 可写成单行或使用
-反引号续行，参数本身相同。交互运行 `--cookie-stdin` 时，终端会隐藏输入；粘贴一行
-Cookie 后按 Enter。管道或重定向输入仍以 EOF 结束。
-
-只用 CLI 时，到这里即可。
-
-### 安装到多个 Agent
-
-先预览，不会写入：
+### 2. 在专用浏览器中登录
 
 ```bash
-python scripts/install_skill.py --host all --mode symlink --dry-run
+.venv/bin/python scripts/login_state.py \
+  --confirm-in-browser \
+  --output /absolute/private/path/xianyu-state.json
 ```
 
-确认后安装：
+只在命令新开的专用浏览器窗口中登录。二维码消失不代表登录完成；还需要完成手机确认，
+回到正常 Goofish 页面，并在本地确认页提交一次性确认码。状态验证和保存完成后，专用
+浏览器自动关闭是正常安全清理，不是闪退。本地安装了 Chrome 且希望明确使用它时，
+增加 `--browser-channel chrome`；这仍会创建独立上下文，不复用日常浏览器 profile。
+
+### 3. 执行一次受控搜索
 
 ```bash
-python scripts/install_skill.py --host all --mode symlink
+.venv/bin/python scripts/spider.py \
+  --keyword "iPhone 15 Pro" \
+  --min-price 3500 \
+  --max-price 5500 \
+  --pages 1 \
+  --retries 1 \
+  --state /absolute/private/path/xianyu-state.json
 ```
 
-这个命令把同一个 checkout 暴露到两个发现目录：
+成功输出的关键字段如下；`count` 仅是一次脱敏实测示例，实际结果会变化：
 
-| 宿主 | 目录 | 调用方式 |
+```json
+{
+  "ok": true,
+  "count": 28,
+  "pages_scraped": 1,
+  "search_capability": {"status": "passed-for-this-run"},
+  "cleanup": {"status": "complete-or-not-required"}
+}
+```
+
+这只证明该浏览器状态在当次运行能够搜索，不证明账号身份或长期认证状态。完整搜索、
+监控和失败语义见下文。
+
+## 兼容与安装方式
+
+| 运行方式 | 发现目录或入口 | 调用方式 |
 |---|---|---|
+| 纯 CLI / 调度器 | 当前 checkout | 直接运行 `scripts/*.py` |
 | Codex | `~/.agents/skills/xianyu-monitor` | `$xianyu-monitor` |
 | Claude Code | `~/.claude/skills/xianyu-monitor` | `/xianyu-monitor` |
 | OpenClaw | `~/.agents/skills/xianyu-monitor` | `/skill xianyu-monitor` |
 
-OpenClaw 中可移植的显式调用是 `/skill xianyu-monitor`。运行时可能另外展示一个
-经过规范化的原生快捷命令；其确切名称由当前版本决定，不要假定它一定是
-`/xianyu-monitor`。
+先预览多宿主安装，不会写入：
 
-当前 [Codex](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills)
-与 [OpenClaw](https://docs.openclaw.ai/skills) 官方文档都列出
-`~/.agents/skills`。不支持目录软链接时，改用
-`--mode copy`；复制模式不会带上 `.git`、虚拟环境、测试缓存或本地任务/登录文件，
-也不会覆盖已有路径。一次多宿主安装若中途失败，会回滚本次已创建的 Skill；已有
-symlink 与请求的 copy 模式不一致时会明确失败，不会伪装成复制安装成功。
-两种模式都先在同一文件系统的私有临时目录中构造，再用平台原子的
-no-replace rename 一次发布；文件系统不支持该保证时会安全失败，不退回到
-check-then-rename。
+```bash
+.venv/bin/python scripts/install_skill.py --host all --mode symlink --dry-run
+```
 
-各宿主的项目级安装、定时任务和注意事项见
+确认后去掉 `--dry-run`。不支持目录软链接时使用 `--mode copy`；复制模式不会带上
+`.git`、虚拟环境、测试缓存或本地任务/登录文件，也不会覆盖已有路径。各宿主的项目级
+安装、定时任务和注意事项见
 [references/host_adapters.md](references/host_adapters.md)。
+
+Windows PowerShell 使用 `.\.venv\Scripts\python.exe` 代替
+`.venv/bin/python`。完整初始化示例：
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+```
 
 ## 浏览器状态
 
@@ -354,6 +345,32 @@ Codex、Claude Code 与 OpenClaw 的 Agent 定时提示词、发现目录和 Ope
 `cron create` 示例统一放在
 [宿主适配文档](references/host_adapters.md)。核心 Skill 不再包含 `{baseDir}`、
 `HEARTBEAT_OK`、`NO_REPLY` 或任何宿主专属调度语法。
+
+## 常见问题
+
+### 是否依赖 OpenClaw？
+
+不依赖。OpenClaw 是受支持的宿主之一；Codex、Claude Code、纯 CLI 和普通系统
+调度器也能使用同一套脚本。
+
+### 是否内置通知或 AI 商品判断？
+
+不内置。核心输出结构化 JSON，由宿主决定如何分析和投递；没有数据证据的信用、真假、
+成色和维修历史必须标记为未知。
+
+### 是否会绕过 CAPTCHA 或平台风控？
+
+不会。检测到登录挑战、CAPTCHA、`RGV587` 或其他风险控制时会停止并明确报错。
+
+### 是否等同于 `ai-goofish-monitor` Web 系统？
+
+不等同。本项目是轻量 Agent Skill/CLI，没有 Web UI、数据库或 Docker 服务；兼容其
+浏览器扩展导出的 Playwright 状态。
+
+### 为什么确认后浏览器会关闭？
+
+候选状态验证并保存后，命令会主动关闭专用浏览器并释放临时资源。这是正常清理；是否
+真正可搜索仍以紧随其后的受控搜索结果为准。
 
 ## 开发与验证
 
