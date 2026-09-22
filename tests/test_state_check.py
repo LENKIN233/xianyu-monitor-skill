@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import state_check
@@ -38,9 +40,11 @@ def test_state_check_accepts_private_candidate_without_echoing_path(
     _write_state(state_file)
     original_check = state_check._require_unchanged
 
-    def check_with_metadata_diff(before: os.stat_result, after: os.stat_result) -> None:
+    def check_with_metadata_diff(
+        before: os.stat_result, after: os.stat_result, *, cross_api: bool = False
+    ) -> None:
         try:
-            original_check(before, after)
+            original_check(before, after, cross_api=cross_api)
         except state_check.StateChangedError:
             fields = (
                 "st_dev",
@@ -71,6 +75,57 @@ def test_state_check_accepts_private_candidate_without_echoing_path(
     assert report["state"] == {"status": "candidate-valid"}
     assert report["search_capability"] == {"status": "not-tested"}
     assert report["next_action"]["code"] == "run-controlled-search"
+
+
+def _windows_metadata(**changes: Any) -> Any:
+    values = {
+        "st_dev": 1,
+        "st_ino": 2,
+        "st_mode": 0o100600,
+        "st_uid": 0,
+        "st_size": 100,
+        "st_mtime_ns": 300,
+        "st_ctime_ns": 100,
+        "st_birthtime_ns": 100,
+    }
+    return SimpleNamespace(**(values | changes))
+
+
+def test_windows_stat_and_fstat_may_have_distinct_ctime_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(state_check, "_WINDOWS_STAT", True)
+    path_snapshot = _windows_metadata()
+    opened_snapshot = _windows_metadata(st_ctime_ns=200)
+
+    state_check._require_unchanged(opened_snapshot, path_snapshot, cross_api=True)
+
+    # A real metadata change within the same API must still be rejected.
+    with pytest.raises(state_check.StateChangedError):
+        state_check._require_unchanged(opened_snapshot, path_snapshot)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "st_dev",
+        "st_ino",
+        "st_size",
+        "st_mtime_ns",
+        "st_birthtime_ns",
+        "st_uid",
+        "st_mode",
+    ],
+)
+def test_windows_cross_api_checks_still_reject_changed_metadata(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    monkeypatch.setattr(state_check, "_WINDOWS_STAT", True)
+    opened = _windows_metadata(st_ctime_ns=200)
+    path_snapshot = _windows_metadata(**{field: getattr(opened, field) + 1})
+
+    with pytest.raises(state_check.StateChangedError):
+        state_check._require_unchanged(opened, path_snapshot, cross_api=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation requires privileges")

@@ -93,6 +93,9 @@ Formal publication requires the clean exact `v2.0.0-rc.1` tag.
 - WeCom text respects its 2048-byte UTF-8 limit while preserving the complete
   item URL and event key. Oversized notification URLs fail before send instead
   of becoming truncated, misleading links.
+- Windows state validation compares creation time consistently across stat/fstat
+  while retaining exact same-handle change detection, avoiding false state-change
+  errors on Python 3.12.
 
 - AI analysis excludes credentials, paths, seller, image, original URL, and
   unknown input fields; API keys are environment-only, redirects are blocked,

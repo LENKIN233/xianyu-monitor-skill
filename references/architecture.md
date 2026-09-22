@@ -92,6 +92,11 @@ not expose the sanitized values. It accepts only absolute paths, bounds file siz
 checks POSIX ownership/access, and compares file identity, size, and modification
 time across validation. Passing means only `candidate-valid`; a real one-page
 search is still required for `passed-for-this-run` capability evidence.
+On Windows Python 3.12, path stat preserves creation time in `ctime`, whereas
+handle fstat may expose change time (see [CPython's path-stat implementation](https://github.com/python/cpython/blob/v3.12.10/Modules/posixmodule.c)
+and [handle-stat implementation](https://github.com/python/cpython/blob/v3.12.10/Python/fileutils.c)).
+Cross-API checks use `st_birthtime_ns` when available; before/after comparisons
+from the same API still require unchanged ctime, identity, size, mtime, and mode.
 
 ## Login candidate evidence
 

@@ -31,6 +31,8 @@ else:
         _has_storage_state_material,
     )
 
+_WINDOWS_STAT = os.name == "nt"
+
 
 class StateAccessError(StateFileError):
     """The candidate path could not be safely opened for inspection."""
@@ -82,12 +84,25 @@ def _privacy_check(metadata: os.stat_result) -> dict[str, Any]:
     }
 
 
-def _require_unchanged(before: os.stat_result, after: os.stat_result) -> None:
+def _require_unchanged(
+    before: os.stat_result,
+    after: os.stat_result,
+    *,
+    cross_api: bool = False,
+) -> None:
+    before_ctime = before.st_ctime_ns
+    after_ctime = after.st_ctime_ns
+    if cross_api and _WINDOWS_STAT:
+        # CPython 3.12 stat(path) preserves creation time in ctime, while
+        # fstat(fd) can expose metadata change time. Compare birthtime across
+        # APIs; same-API snapshots must still detect ctime changes exactly.
+        before_ctime = getattr(before, "st_birthtime_ns", before_ctime)
+        after_ctime = getattr(after, "st_birthtime_ns", after_ctime)
     if (
         not os.path.samestat(before, after)
         or before.st_size != after.st_size
         or before.st_mtime_ns != after.st_mtime_ns
-        or before.st_ctime_ns != after.st_ctime_ns
+        or before_ctime != after_ctime
         or before.st_uid != after.st_uid
         or stat.S_IMODE(before.st_mode) != stat.S_IMODE(after.st_mode)
     ):
@@ -130,7 +145,7 @@ def _require_path_still_points_to_open_file(
     if final_privacy["status"] == "failed":
         return final_privacy
     _require_unchanged(identity.resolved, resolved)
-    _require_unchanged(opened, resolved)
+    _require_unchanged(opened, resolved, cross_api=True)
     return final_privacy
 
 
