@@ -32,9 +32,35 @@ def _write_state(path: Path) -> None:
 def test_state_check_accepts_private_candidate_without_echoing_path(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state_file = tmp_path / "private-state.json"
     _write_state(state_file)
+    original_check = state_check._require_unchanged
+
+    def check_with_metadata_diff(before: os.stat_result, after: os.stat_result) -> None:
+        try:
+            original_check(before, after)
+        except state_check.StateChangedError:
+            fields = (
+                "st_dev",
+                "st_ino",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+                "st_uid",
+                "st_mode",
+            )
+            changed = {
+                field: (getattr(before, field), getattr(after, field))
+                for field in fields
+                if getattr(before, field) != getattr(after, field)
+            }
+            pytest.fail(
+                f"unchanged synthetic candidate has metadata differences: {changed}"
+            )
+
+    monkeypatch.setattr(state_check, "_require_unchanged", check_with_metadata_diff)
 
     assert state_check.main(["--state", str(state_file)]) == 0
     output = capsys.readouterr().out
