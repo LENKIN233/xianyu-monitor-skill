@@ -26,6 +26,26 @@ def test_parse_cookie_preserves_equals_in_value() -> None:
     ]
 
 
+def test_parse_cookie_rejects_duplicate_names() -> None:
+    with pytest.raises(ValueError, match="duplicate cookie name") as captured:
+        parse_cookie_string("session=first; session=second")
+
+    assert "session" not in str(captured.value)
+
+
+@pytest.mark.parametrize("header", ["bad name=value", "bad,name=value"])
+def test_parse_cookie_rejects_invalid_names(header: str) -> None:
+    with pytest.raises(ValueError, match="invalid cookie name"):
+        parse_cookie_string(header)
+
+
+def test_parse_cookie_rejects_unpaired_segment_without_echoing_it() -> None:
+    with pytest.raises(ValueError, match="invalid cookie pair") as captured:
+        parse_cookie_string("session=first; private-fragment")
+
+    assert "private-fragment" not in str(captured.value)
+
+
 def test_create_state_uses_private_permissions(tmp_path: Path) -> None:
     private_dir = tmp_path / "private"
     output = create_storage_state("cookie2=secret", str(private_dir / "state.json"))

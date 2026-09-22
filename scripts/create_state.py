@@ -8,6 +8,7 @@ import asyncio
 import getpass
 import json
 import os
+import re
 import secrets
 import stat
 import sys
@@ -24,6 +25,7 @@ else:
 
 _PRIVATE_CREDENTIAL_MODE = stat.S_IRUSR | stat.S_IWUSR
 _PRIVATE_DIRECTORY_MODE = stat.S_IRWXU
+_COOKIE_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 
 
 @dataclass
@@ -61,14 +63,20 @@ def parse_cookie_string(cookie_string: str) -> list[dict[str, Any]]:
     """Parse a Cookie header into Playwright cookie dictionaries."""
 
     cookies: list[dict[str, Any]] = []
+    names: set[str] = set()
     for raw_item in cookie_string.split(";"):
         item = raw_item.strip()
-        if not item or "=" not in item:
+        if not item:
             continue
+        if "=" not in item:
+            raise ValueError("cookie input contains an invalid cookie pair")
         name, value = item.split("=", 1)
         name = name.strip()
-        if not name:
-            continue
+        if not name or _COOKIE_NAME.fullmatch(name) is None:
+            raise ValueError("cookie input contains an invalid cookie name")
+        if name in names:
+            raise ValueError("cookie input contains a duplicate cookie name")
+        names.add(name)
         cookies.append(
             {
                 "name": name,

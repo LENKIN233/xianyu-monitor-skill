@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_skill_uses_strict_portable_frontmatter() -> None:
+def test_skill_uses_portable_frontmatter() -> None:
     text = (ROOT / "SKILL.md").read_text(encoding="utf-8")
     frontmatter = text.split("---", 2)[1]
     keys = [line.split(":", 1)[0] for line in frontmatter.splitlines() if ":" in line]
@@ -39,13 +39,19 @@ def test_every_referenced_skill_resource_exists() -> None:
         "references/api_reference.md",
         "references/architecture.md",
         "references/host_adapters.md",
+        "scripts/analyze.py",
         "scripts/cdp_profile.py",
         "scripts/create_state.py",
+        "scripts/demo.py",
         "scripts/doctor.py",
         "scripts/login_state.py",
         "scripts/monitor.py",
+        "scripts/setup.py",
         "scripts/spider.py",
+        "scripts/state_check.py",
         "scripts/task_manager.py",
+        "scripts/version_info.py",
         "scripts/xianyu.py",
+        "VERSION",
     ):
         assert (ROOT / relative_path).exists(), relative_path

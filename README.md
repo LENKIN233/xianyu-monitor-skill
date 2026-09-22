@@ -6,8 +6,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 用本地私有浏览器状态搜索和持续监控闲鱼 / Goofish 商品，支持关键词、价格、地区、
-真实分页、持久任务和新观察商品去重。核心不依赖特定 Agent，可用于 Codex、
-Claude Code、OpenClaw 或普通 CLI/调度器。
+真实分页、持久任务、新观察商品去重，以及显式授权后的可选 AI 排序。核心不依赖特定
+Agent，可用于 Codex、Claude Code、OpenClaw 或普通 CLI/调度器。
 
 Search and monitor Xianyu/Goofish listings with private local browser state.
 Works across Codex, Claude Code, OpenClaw, and CLI schedulers.
@@ -19,15 +19,60 @@ Works across Codex, Claude Code, OpenClaw, and CLI schedulers.
 | 搜索商品，执行价格和地区过滤 | 绕过 CAPTCHA、登录挑战或平台风控 |
 | 真实翻页并按商品 ID 去重 | 自动联系卖家、购买、下单或付款 |
 | 保存任务，只返回新观察到的商品 | 凭空判断卖家信用、真假或维修历史 |
-| 输出稳定 JSON 供任意宿主投递 | 内置 AI 商品分析或通知渠道 |
+| 本地自检状态文件，不启动浏览器 | 默认把商品或凭据发送给 AI |
+| 可选 AI 匹配度、证据与风险信号分析 | 让 AI 凭空断言真假、信用或实际成色 |
+| 输出稳定 JSON 供任意宿主投递 | 把 API 返回的任意商品跳转链接交给用户点击 |
 
 失败、登录跳转和风险控制会明确返回错误，不会伪装成“没有商品”。Cookie、代理凭据和
 登录状态始终视为私密凭据；本项目不会把它们作为通知内容或提交到仓库。
 
-## 三步快速开始
+## 30 秒离线体验
+
+用当前 Python 即可查看完整产品流。该命令只使用内置合成数据，明确标记为
+`synthetic`，不联网、不读取凭据、不写本地文件，也不声称连接过闲鱼：
+
+```bash
+python3 scripts/xianyu.py demo
+```
+
+输出依次展示脱敏搜索结果、结构化 AI 排序、运行哈希、离线黄金集评测、durable outbox
+幂等键和端点脱敏后的通知预览。查看 `next_action` 后，再进入真实授权 setup。
+
+接下来按用途选择：[首次安装与搜索](#引导式首次运行)、
+[持续监控](#持久监控)、[从旧版本升级](#从-v1-升级)。
+
+## 引导式首次运行
 
 需要 Python 3.10+。强烈建议把状态文件放在仓库之外的用户私有绝对路径；若确需放入
 checkout，只能使用已被整个目录忽略的私有目录。
+Windows PowerShell 请将下列 `.venv/bin/python` 替换为
+`.\.venv\Scripts\python.exe`；[完整 Windows 初始化示例](#兼容与安装方式)也列在下文。
+
+在 checkout 根目录先安装依赖：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python scripts/xianyu.py doctor
+```
+
+按 `doctor` 的 `next_action` 处理浏览器依赖；已有本机 Chrome 时按提示增加
+`--browser-channel chrome`。随后让一个命令串联本地检查、可选登录、状态校验和
+一页一次能力测试：
+
+```bash
+.venv/bin/python scripts/xianyu.py setup \
+  --state /absolute/private/path/xianyu-state.json \
+  --keyword "iPhone 15 Pro" \
+  --capture-state
+```
+
+`--keyword` 必须由用户明确给出，命令不会发起隐藏默认搜索。若状态已存在，它不会覆盖
+或重新登录；若不存在且未提供 `--capture-state`，只返回安全 handoff。`setup` 不安装
+依赖或浏览器，也不会代输确认码；任一阶段失败立即停止，stdout 只输出一份最终 JSON，
+路径、Cookie 和商品明细不会进入汇总。以下手工三步仍完整支持。
+
+## 三步手工流程
 
 ### 1. 安装
 
@@ -63,6 +108,9 @@ python3 -m venv .venv
 ### 3. 执行一次受控搜索
 
 ```bash
+.venv/bin/python scripts/xianyu.py state \
+  --state /absolute/private/path/xianyu-state.json
+
 .venv/bin/python scripts/xianyu.py search \
   --keyword "iPhone 15 Pro" \
   --min-price 3500 \
@@ -71,6 +119,9 @@ python3 -m venv .venv
   --retries 1 \
   --state /absolute/private/path/xianyu-state.json
 ```
+
+`state` 只检查候选文件的隐私权限、大小和过滤后的结构，不启动浏览器、不输出路径或
+Cookie，也不声称已经登录。它通过后仍必须执行下面的一页真实搜索，才能证明当次搜索能力。
 
 成功输出的关键字段如下；`count` 仅是一次脱敏实测示例，实际结果会变化：
 
@@ -110,6 +161,17 @@ Skill references/宿主元数据和许可证，不会带仓库 README、`.git`�
 安装、定时任务和注意事项见
 [references/host_adapters.md](references/host_adapters.md)。
 
+查看机器可读版本、能力与既有安装健康（全部离线、只读）：
+
+```bash
+.venv/bin/python scripts/xianyu.py version
+.venv/bin/python scripts/xianyu.py install --host all --check
+```
+
+copy 安装会携带私有 `.xianyu-install.json` 摘要清单。健康状态区分
+`absent/current/stale/modified/incomplete/unrecognized/wrong-mode/not-established`，
+只报告下一步，不覆盖、删除、更新或修复已有 Skill。
+
 Windows PowerShell 使用 `.\.venv\Scripts\python.exe` 代替
 `.venv/bin/python`。完整初始化示例：
 
@@ -121,6 +183,56 @@ py -3 -m venv .venv
 
 Windows 上也只在 `next_action.code` 为 `install-browser` 时运行
 `.\.venv\Scripts\python.exe -m playwright install chromium`。
+
+## 从 v1 升级
+
+2.0 包含首次运行引导、状态检查、AI 分析、任务迁移、持久待投递队列和通知适配器。
+`2.0.0-rc.1` 是候选版；真实闲鱼、所选 AI 和通知服务的联调完成前不标记为稳定版。
+
+1. 暂停宿主调度，等待正在运行的监控或投递结束。备份原始任务文件到用户私有目录，
+   保留旧程序与依赖环境；备份同样包含私有路径和商品记录，不要提交或上传。
+2. 在独立 checkout 中安装新版本与依赖，执行 `version`、`doctor` 和 `demo`。
+   copy 安装不会覆盖旧目录；symlink 安装会随其目标 checkout 变化，先核对指向。
+3. 用新版本读取原任务并检查定义。旧 schema 1/2 可读取，首次成功写入时保存为
+   schema 3，保留任务和去重历史。已有任务继续正常监控，不要重建基线或 `reset-seen`。
+4. 核对调度器的绝对 Python、任务和状态路径后恢复运行。需要通知时，再为持久 outbox
+   配置所选投递方式；监控不会自动外发。
+
+兼容性变化：搜索最多 20 页、最多 10 次尝试；超出限制的旧任务仍可查看、停止或删除，
+运行前需调整到当前边界。不存在的任务文件返回明确错误，不再当作空任务列表。
+旧相对状态路径必须改为已授权的绝对路径。
+
+`task export` 只导出可移植定义，不包含去重历史、outbox 或状态路径，**不能代替完整备份**。
+需要回退时先暂停调度，另存当前 schema 3 文件并核对待投递事件，再让旧程序使用升级前
+备份；不要让旧程序写入新格式。恢复旧去重历史后可能再次观察到升级期间的商品，需注意
+重复通知。状态文件仍仅通过原私有路径使用。
+
+## 可验证发布包
+
+最小 Skill bundle 与 GitHub 源码包是两个产物。bundle 只含运行时、Skill 指令、必要
+references、宿主元数据、许可证和精确依赖锁；不包含 README、ROADMAP、CHANGELOG、
+SECURITY、测试、Git 历史或用户数据。构建会固定文件顺序、时间、权限、UID/GID，并生成
+`MANIFEST.json`、SPDX 2.3 `SBOM.spdx.json` 与外部 SHA-256 文件：
+
+```bash
+.venv/bin/python scripts/release_bundle.py self-check
+.venv/bin/python scripts/release_bundle.py build --output-dir dist
+.venv/bin/python scripts/release_bundle.py verify \
+  --bundle dist/xianyu-monitor-$(cat VERSION).tar.gz
+```
+
+正式发布必须给 `build` 增加 `--release`；它只接受 clean checkout、无未跟踪文件且当前
+提交带精确 `vVERSION` tag，并逐文件验证 bundle 内容来自该 commit；commit 与 tag 会写入
+manifest。CI 的三平台矩阵都会执行两次构建一致性、bundle 校验、从空 HOME 的 copy
+安装，以及解包前后完全一致的离线 demo smoke。GitHub Actions 均固定到完整 commit SHA。
+
+tag CI 在上述检查通过后创建 GitHub Release 草稿、上传 bundle 和 SHA-256，下载附件
+重新校验后才发布。候选版本自动标记为 prerelease，不替换最新稳定版。bundle 内的
+manifest 和 SBOM 随包交付；源码包和 Actions artifact 均不能代替该安装包。
+
+`2.0.0-rc.1` 升为稳定版前还需要在用户明确授权下完成一次真实一页搜索，以及分别对
+所选 AI 端点和通知适配器执行 preview → digest-bound send。公开验收只保留版本、退出码、
+能力/持久化/外发状态和脱敏计数，不保存 Cookie、状态路径、端点、Key 或真实商品文本。
 
 ## 浏览器状态
 
@@ -232,6 +344,17 @@ chmod 600 /absolute/private/path/xianyu-state.json
 `chmod 600` 适用于 POSIX 系统；Windows 请把文件放在用户私有目录，并使用 NTFS ACL
 限制访问。
 
+对于新捕获、扩展导出或 Cookie 导入的状态，先做不联网自检：
+
+```bash
+.venv/bin/python scripts/xianyu.py state \
+  --state /absolute/private/path/xianyu-state.json
+```
+
+成功只返回 `state.status: candidate-valid` 和下一步 `run-controlled-search`。POSIX 下只接受
+当前用户拥有且无 group/other 权限的文件；Windows 权限由平台 ACL 管理。该命令不会读取
+身份字段供输出，也不会替代真实搜索验证。
+
 ## 单次搜索
 
 ```bash
@@ -275,6 +398,71 @@ chmod 600 /absolute/private/path/xianyu-state.json
 `ArgumentError` JSON 并退出 `2`；`SIGTERM` 会进入与用户取消相同的受控清理路径，
 输出取消 JSON 并退出 `130`。
 价格必须是有限数值，`NaN` 和正负无穷都会被拒绝。
+每次搜索最多 20 页、最多 10 次尝试；持久任务也执行相同上限，避免错误配置造成无界运行。
+输出的商品链接始终由捕获到的商品 ID 构造为 `https://www.goofish.com/item?...`，不会
+转发 API 数据中的站外或可执行 scheme。
+
+## 可选 AI 分析
+
+AI 是独立的后处理步骤：搜索、监控和去重完全不依赖 AI。先把成功的搜索或监控 stdout
+保存为 JSON，然后预览将要外发的字段：
+
+```bash
+.venv/bin/python scripts/xianyu.py analyze \
+  --input /absolute/path/results.json \
+  --criteria "优先 16GB、上海自提；缺少电池信息要标为不确定" \
+  --preview
+```
+
+预览只输出经过 allowlist 的 `source_index/id/title/price/location/publish_time/wants/tags/criteria`，
+不联网，也不需要 API Key；卖家、图片、原始 URL、未知字段、任务路径和浏览器状态不会进入
+请求。它还输出 `approval.preview_sha256`，把本次确认绑定到精确请求体、模型和 HTTPS
+端点。确认后，把 Key 放在环境变量而不是命令行，并原样传回该摘要：
+
+```bash
+# 先通过 shell 或宿主的 secret manager 设置 OPENAI_API_KEY
+.venv/bin/python scripts/xianyu.py analyze \
+  --input /absolute/path/results.json \
+  --criteria "优先 16GB、上海自提；缺少电池信息要标为不确定" \
+  --consent-send-listings \
+  --expected-preview-sha256 SHA256_FROM_PREVIEW
+```
+
+正式调用必须保持预览时筛选出的 allowlist 商品证据、criteria、模型和端点不变；任何
+改变最终请求体或目标端点的变化都会使摘要不匹配，并在联网前失败。失败监控结果默认仍被拒绝；若其中已经可靠写入了新商品，
+可在预览和正式调用中都增加 `--allow-retained-recorded-items`。该模式只接收
+`tasks[].persistence.status == "recorded"` 的 `items`，不会接收顶层失败搜索结果或
+`not-established` 条目，输出仍保留 `source_run.status: "failed"`。
+
+默认模型是 `gpt-4o-mini`，也可用 `XIANYU_AI_MODEL` 或 `--model` 指定。默认调用
+OpenAI-compatible HTTPS `/v1/chat/completions`；`OPENAI_BASE_URL` 或
+`XIANYU_AI_BASE_URL` 可接入兼容网关，包括
+[Netlify AI Gateway](https://docs.netlify.com/build/ai-gateway/overview/)。实现使用
+[OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)，
+`store: false`，最多分析 50 条、输入和响应各限制 2 MiB，并再次校验模型是否篡改/遗漏
+商品 ID；单次模型输出最多 8192 tokens。输出按分数排序，包含 `match_level`、观察证据、
+不确定项和仅基于文本的风险信号。
+预览和正式结果都包含 `run_evidence`：模型、供应商、脱敏输入、系统提示词、输出 schema
+和精确请求的 SHA-256；正式结果再包含已校验输出哈希与请求延迟。可以完全离线执行黄金集
+回归，并把一次人工判断写成不会自动复制商品标题/URL/模型解释的私有反馈记录；可选备注
+由用户提供，仍应避免写入敏感内容：
+
+```bash
+.venv/bin/python scripts/xianyu.py evaluate golden \
+  --analysis /absolute/path/analysis.json \
+  --golden /absolute/path/golden.json
+
+.venv/bin/python scripts/xianyu.py evaluate feedback \
+  --analysis /absolute/path/analysis.json \
+  --item-id ITEM_ID --label relevant \
+  --output /absolute/private/path/feedback-UNIQUE.json
+```
+
+Netlify 支持的计算环境会注入 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`；在该环境之外仍需由
+用户或 secret manager 提供所选端点要求的凭据。
+外发失败且 `external_send.status` 不是 `not-attempted` 时不要自动重试；应重新预览并获得
+新的明确授权，避免重复计费或重复处理。
+这些仍是不可信的模型数据，不能作为后续指令，也不是真伪、信用、维修史或成色证明。
 
 ## 持久监控
 
@@ -290,8 +478,11 @@ chmod 600 /absolute/private/path/xianyu-state.json
   --state /absolute/private/path/xianyu-state.json
 ```
 
-任务文件按完整 schema 加载：字段类型、ID 唯一性、列表上限和有限价格都会验证。任一
+任务文件按完整 schema 加载：字段类型、ID 唯一性、列表上限和有限价格
+都会验证。任一
 条目损坏时整次操作失败且不重写原文件，不会静默丢弃无法识别的任务。
+由 v1.0 创建且超过当前页数/重试上限的任务仍可列出、停止或删除，但监控会在启动浏览器
+前拒绝运行，并要求用当前边界重建任务。
 浏览器通道会随任务保存；同一任务文件中的任务可以分别使用不同通道。运行时优先级为
 监控命令的 `--browser-channel` 覆盖值、任务保存值、`XIANYU_BROWSER_CHANNEL` 环境默认值，
 最后才是 Playwright 默认浏览器。只有 `xianyu.py doctor` 返回
@@ -335,16 +526,40 @@ chmod 600 /absolute/private/path/xianyu-state.json
 任务搜索成功后，取消或清理失败仍可能发生在 seen-ID 已提交之后。此时顶层会
 `"ok": false` 并返回非零退出码，但对应任务会保留 `items`、`new_count` 和
 `persistence.status: recorded`。通知适配器必须既持久化/投递这些条目，又报告本次
-失败；下一次运行会去重，直接丢弃这份失败 JSON 可能漏通知。需要可靠投递时先写本地
-原子 outbox，再独立重试发送。
+失败；下一次运行会去重，直接丢弃这份失败 JSON 可能漏通知。新商品会和 seen ID 在
+同一原子提交中写入 durable outbox；适配器通过 `task outbox list` 读取，复用
+`idempotency_key`，仅在外部投递确认成功后执行 `task outbox ack`。
+
+也可以使用内置的显式适配器。端点只放在环境变量
+`XIANYU_WEBHOOK_URL`、`XIANYU_BARK_URL` 或 `XIANYU_WECOM_WEBHOOK_URL`，绝不放在 argv。
+先预览所选事件、端点哈希和精确请求体，再以同一摘要发送：
+
+```bash
+.venv/bin/python scripts/xianyu.py deliver \
+  --data-file /absolute/private/path/tasks.json \
+  --adapter webhook --task-id TASK_ID --preview
+
+.venv/bin/python scripts/xianyu.py deliver \
+  --data-file /absolute/private/path/tasks.json \
+  --adapter webhook --task-id TASK_ID --send \
+  --expected-preview-sha256 SHA256_FROM_PREVIEW
+```
+
+Webhook、Bark 和企业微信均只走 HTTPS 且禁止重定向。事件仅在供应商明确确认成功后逐条
+ack；Bark/企业微信的成功码必须是整数。若发送超时、发送中取消或本地 ack 无法确定，
+事件保留并返回 `possible_duplicate: true`；未收到响应不等于未送达，不要盲目重试。
 
 如果任务文件的原子替换可能已发生、但提交核验失败，任务会保留候选 `items`，并输出
 `persistence.status: not-established` 与 `possible_duplicate: true`。仍应按
-at-least-once 语义进入 outbox，同时报告失败并允许后续重复；重复通知优于已提交 ID
+at-least-once 语义处理，同时报告失败并允许后续重复；重复通知优于已提交 ID
 导致的永久漏报。
 
 任务中的 `criteria` 只是原样返回给 Agent 的自然语言分析提示，不是可执行过滤器。
 纯命令模式严格执行的条件只有关键词、价格和地区。
+
+修改任务必须先运行 `task update ... --preview`，再使用返回的 SHA-256 对同参数执行
+`--apply`。`task export` 只导出可移植定义，不含状态路径、运行历史或 outbox；导入前
+同样需要预览，导入结果默认停止且不绑定登录状态，检查后再显式配置并 resume。
 
 ## 定时运行
 
@@ -373,8 +588,9 @@ Codex、Claude Code 与 OpenClaw 的 Agent 定时提示词、发现目录和 Ope
 
 ### 是否内置通知或 AI 商品判断？
 
-不内置。核心输出结构化 JSON，由宿主决定如何分析和投递；没有数据证据的信用、真假、
-成色和维修历史必须标记为未知。
+监控不会自动通知，也不默认启用 AI。可选 `deliver` 只在预览并校验同一 SHA-256 后调用
+环境变量配置的 Webhook/Bark/企业微信端点；可选 `analyze` 也只在独立预览和显式授权后
+外发 allowlist 商品证据。没有数据证据的信用、真假、成色和维修历史必须标记为未知。
 
 ### 是否会绕过 CAPTCHA 或平台风控？
 
@@ -407,6 +623,10 @@ smoke test，必须由用户本人在本机可见浏览器中登录并输入一�
 
 离线测试同时覆盖非 TTY fail-closed、浏览器确认、旧 raw-CDP 参数拒绝和旧 profile
 迁移清理；这些用例只使用合成状态，不读取真实 profile 或网络。
+CI 在 Linux、macOS 和 Windows 的 Python 3.10/3.12 上运行相同门禁。
+
+项目的版本目标和取舍见 [ROADMAP.md](ROADMAP.md)，安全报告方式见
+[SECURITY.md](SECURITY.md)，每轮用户可见变更记录在 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 安全说明
 
@@ -425,7 +645,9 @@ smoke test，必须由用户本人在本机可见浏览器中登录并输入一�
   一次 `--headed`。
 - 遇到 `SearchRejectedError` 应停止重试并报告；`RGV587` 时让请求/会话冷却，
   此时账号身份仍未知。不重新登录、不换代理，也不再用 `--headed` 尝试。
-- AI 只能依据抓取字段分析；卖家信用、维修史、真伪和实际成色需要人工核验。
+- AI 外发必须先预览并获得明确同意；API Key 只从环境读取。AI 只能依据 allowlist
+  字段分析；模型输出仍作为不可信数据而非指令。卖家信用、维修史、真伪和实际成色需要
+  人工核验。
 - 请遵守闲鱼服务条款和当地法律。本项目仅供学习与个人辅助使用。
 
 ## English
@@ -434,7 +656,7 @@ Xianyu Monitor is a host-neutral Agent Skill and CLI for browser-state-backed
 Xianyu searches and recurring listing checks. Its core is independent from Codex,
 Claude Code, OpenClaw, schedulers, and notification transports. It provides real
 pagination, strict local filters, persistent deduplication, stable JSON, tests,
-and optional host adapters. See `SKILL.md` for the agent workflow and
+optional consent-gated AI ranking, and host adapters. See `SKILL.md` for the agent workflow and
 `references/host_adapters.md` for installation and scheduling.
 
 ## License

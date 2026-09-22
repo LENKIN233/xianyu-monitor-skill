@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,9 @@ import install_skill as installer
 import pytest
 from install_skill import REQUIRED_COPY_FILES, install_skill
 
+ROOT = Path(__file__).resolve().parents[1]
+EXPECTED_VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
+
 
 def _make_complete_source(source: Path, *, name: str = "xianyu-monitor") -> None:
     for relative_name in REQUIRED_COPY_FILES:
@@ -18,6 +22,8 @@ def _make_complete_source(source: Path, *, name: str = "xianyu-monitor") -> None
         path.parent.mkdir(parents=True, exist_ok=True)
         if relative_name == "SKILL.md":
             content = f"---\nname: {name}\ndescription: test\n---\n"
+        elif relative_name == "VERSION":
+            content = f"{EXPECTED_VERSION}\n"
         else:
             content = "# test\n"
         path.write_text(content, encoding="utf-8")
@@ -71,10 +77,15 @@ def test_copy_mode_uses_distributable_allowlist(tmp_path: Path) -> None:
     target = home / ".claude/skills/xianyu-monitor"
     assert (target / "LICENSE").is_file()
     assert (target / "SKILL.md").is_file()
+    assert (target / "scripts/analyze.py").is_file()
     assert (target / "scripts/cdp_profile.py").is_file()
     assert (target / "scripts/doctor.py").is_file()
     assert (target / "scripts/monitor.py").is_file()
+    assert (target / "scripts/setup.py").is_file()
+    assert (target / "scripts/state_check.py").is_file()
+    assert (target / "scripts/version_info.py").is_file()
     assert (target / "scripts/xianyu.py").is_file()
+    assert (target / "VERSION").is_file()
     assert not (target / "README.md").exists()
     assert not (target / "scripts/state.json").exists()
     assert not (target / "tests").exists()
@@ -104,6 +115,287 @@ def test_copy_install_unified_cli_runs_from_foreign_directory(tmp_path: Path) ->
     assert result.returncode == 0
     assert result.stdout.splitlines()[0].startswith("usage: xianyu.py task")
     assert "--data-file" in result.stdout
+
+
+def test_copy_install_writes_verifiable_private_manifest(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    install_skill(
+        source=source,
+        home=home,
+        hosts=["codex"],
+        mode="copy",
+    )
+    target = home / ".agents/skills/xianyu-monitor"
+
+    manifest = json.loads((target / installer.INSTALL_MANIFEST).read_text())
+    assert manifest["schema_version"] == 1
+    assert manifest["skill"] == {
+        "name": "xianyu-monitor",
+        "version": EXPECTED_VERSION,
+    }
+    assert {record["path"] for record in manifest["files"]} == set(
+        installer.BUNDLE_FILES
+    )
+    if os.name != "nt":
+        assert (target / installer.INSTALL_MANIFEST).stat().st_mode & 0o077 == 0
+
+
+def test_install_health_reports_current_copy_without_paths(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1]
+    home = tmp_path / "private-home"
+    install_skill(source=source, home=home, hosts=["codex"], mode="copy")
+
+    records = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+    )
+
+    assert records == [
+        {
+            "hosts": ["codex"],
+            "status": "current",
+            "mode": "copy",
+            "expected_version": EXPECTED_VERSION,
+            "installed_version": EXPECTED_VERSION,
+        }
+    ]
+    assert str(home) not in json.dumps(records)
+
+
+def test_install_health_detects_modified_copy(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    install_skill(source=source, home=home, hosts=["codex"], mode="copy")
+    target = home / ".agents/skills/xianyu-monitor"
+    (target / "scripts/xianyu.py").write_text("# locally modified\n")
+
+    records = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+    )
+
+    assert records[0]["status"] == "modified"
+
+
+def test_install_health_detects_same_version_source_change(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _make_complete_source(source)
+    home = tmp_path / "home"
+    install_skill(source=source, home=home, hosts=["codex"], mode="copy")
+
+    (source / "scripts/setup.py").write_text("# newer source payload\n")
+    records = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+    )
+
+    assert records[0]["status"] == "stale"
+
+
+def test_install_health_detects_untracked_nested_file(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _make_complete_source(source)
+    home = tmp_path / "home"
+    install_skill(source=source, home=home, hosts=["codex"], mode="copy")
+    target = home / ".agents/skills/xianyu-monitor"
+    (target / "references/extra.md").write_text("unexpected\n")
+
+    records = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+    )
+
+    assert records[0]["status"] == "modified"
+
+
+def test_install_health_detects_unexpected_executable_in_copy(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    install_skill(source=source, home=home, hosts=["codex"], mode="copy")
+    target = home / ".agents/skills/xianyu-monitor"
+    (target / "scripts/json.py").write_text("raise RuntimeError('shadow')\n")
+
+    records = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+    )
+
+    assert records[0]["status"] == "modified"
+
+
+def test_install_health_rejects_untracked_bytecode_cache(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    install_skill(source=source, home=home, hosts=["codex"], mode="copy")
+    cache = home / ".agents/skills/xianyu-monitor/scripts/__pycache__"
+    cache.mkdir()
+    (cache / "cli_contract.cpython-312.pyc").write_bytes(b"untrusted bytecode")
+
+    records = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+    )
+
+    assert records[0]["status"] == "modified"
+
+
+def test_release_copy_health_detects_provenance_tampering(tmp_path: Path) -> None:
+    source = tmp_path / "release"
+    shutil.copytree(
+        Path(__file__).resolve().parents[1],
+        source,
+        ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__", ".pytest_cache"),
+    )
+    for relative_name in installer.OPTIONAL_PROVENANCE_FILES:
+        (source / relative_name).write_text(f'{{"file":"{relative_name}"}}\n')
+    home = tmp_path / "home"
+    install_skill(source=source, home=home, hosts=["codex"], mode="copy")
+    target = home / ".agents/skills/xianyu-monitor"
+
+    manifest = json.loads((target / installer.INSTALL_MANIFEST).read_text())
+    assert {record["path"] for record in manifest["files"]} >= set(
+        installer.OPTIONAL_PROVENANCE_FILES
+    )
+    (target / "SBOM.spdx.json").write_text("{}\n")
+    records = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+    )
+    assert records[0]["status"] == "modified"
+
+
+def test_copy_install_rejects_partial_provenance_without_target(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _make_complete_source(source)
+    (source / "MANIFEST.json").write_text("{}\n")
+    home = tmp_path / "home"
+
+    with pytest.raises(ValueError, match="provenance"):
+        install_skill(source=source, home=home, hosts=["codex"], mode="copy")
+
+    assert not (home / ".agents/skills/xianyu-monitor").exists()
+
+
+def test_copy_health_rejects_provenance_added_after_install(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    install_skill(source=source, home=home, hosts=["codex"], mode="copy")
+    target = home / ".agents/skills/xianyu-monitor"
+    for relative_name in installer.OPTIONAL_PROVENANCE_FILES:
+        (target / relative_name).write_text("{}\n")
+
+    records = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+    )
+
+    assert records[0]["status"] == "modified"
+
+
+def test_install_health_detects_incomplete_legacy_copy(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    target = home / ".agents/skills/xianyu-monitor"
+    target.mkdir(parents=True)
+    (target / "SKILL.md").write_text(
+        "---\nname: xianyu-monitor\ndescription: old\n---\n"
+    )
+    (target / "VERSION").write_text("1.0.0\n")
+
+    records = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+    )
+
+    assert records[0]["status"] == "incomplete"
+
+
+def test_install_health_reports_absent_and_wrong_mode(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1]
+    home = tmp_path / "home"
+    absent = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+        expected_mode="copy",
+    )
+    assert absent[0]["status"] == "absent"
+
+    install_skill(source=source, home=home, hosts=["codex"], mode="copy")
+    wrong_mode = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+        expected_mode="symlink",
+    )
+    assert wrong_mode[0]["status"] == "wrong-mode"
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows directory symlinks depend on host policy",
+)
+def test_install_health_detects_incomplete_symlink_source(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _make_complete_source(source)
+    home = tmp_path / "home"
+    install_skill(source=source, home=home, hosts=["codex"], mode="symlink")
+    (source / "scripts/setup.py").unlink()
+
+    records = installer.check_installations(
+        source=source,
+        home=home,
+        hosts=["codex"],
+    )
+
+    assert records[0]["status"] == "incomplete"
+
+
+def test_install_check_cli_is_read_only_and_structured(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+
+    assert installer.main(["--home", str(home), "--host", "codex", "--check"]) == 2
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["check"] == "offline-installation-health"
+    assert payload["installs"][0]["status"] == "absent"
+    assert not home.exists()
+    assert str(home) not in json.dumps(payload)
+
+
+def test_install_check_failure_has_actionable_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        installer,
+        "check_installations",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("private detail")),
+    )
+
+    assert (
+        installer.main(["--home", str(tmp_path / "home"), "--host", "codex", "--check"])
+        == 2
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["next_action"]["code"] == "rerun-install-check"
+    assert "private detail" not in json.dumps(payload)
 
 
 def test_installer_refuses_to_replace_existing_path(tmp_path: Path) -> None:

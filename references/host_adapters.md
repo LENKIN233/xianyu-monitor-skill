@@ -7,7 +7,9 @@ same Agent Skills directory and one-shot monitor command to common hosts.
 
 - [Discovery paths](#discovery-paths)
 - [Install from one checkout](#install-from-one-checkout)
+- [Windows PowerShell initialization](#windows-powershell-initialization)
 - [Generic scheduler](#generic-scheduler)
+- [Delivery adapters](#delivery-adapters)
 - [Codex](#codex)
 - [Claude Code](#claude-code)
 - [OpenClaw](#openclaw)
@@ -59,6 +61,25 @@ are explicit: copy refuses an existing symlink instead of misreporting it.
 After a copy install, prepare the virtual environment inside each independent
 copy. A symlink install shares one checkout and one virtual environment.
 
+## Windows PowerShell initialization
+
+From the checkout or independent copy:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe scripts\xianyu.py doctor
+```
+
+If `doctor` returns `next_action.code: install-browser`, run:
+
+```powershell
+.\.venv\Scripts\python.exe -m playwright install chromium
+```
+
+Then rerun `doctor`. Reuse `.\.venv\Scripts\python.exe` for every command in
+the core Skill; never substitute the POSIX `.venv/bin/python` path on Windows.
+
 ## Generic scheduler
 
 Every scheduler should run one process and inspect its exit code. Use
@@ -75,19 +96,46 @@ CLI parsing failures are JSON on stdout with exit `2`. Scheduler
 `SIGTERM` is converted to controlled cancellation, including cleanup evidence,
 and exits `130`; do not discard that final JSON.
 
-The core commits seen IDs before the host delivers stdout. It therefore
-deduplicates collection but cannot promise exactly-once external delivery. For
-durable notifications, make the adapter write successful non-empty stdout to
-an atomic local outbox before forwarding it, and retry the outbox independently.
-Also enqueue retained items from a nonzero result when their task reports
-`persistence.status: recorded`; post-commit cancellation/finalization can expose
-new items that a later run will deduplicate. Surface the failure separately and
-never treat the retained items as proof that the whole batch succeeded.
+The core commits seen IDs and durable outbox events atomically, but cannot promise
+exactly-once external delivery. Read pending events with `task outbox list`,
+reuse each `idempotency_key` at the destination, and run `task outbox ack` only
+after confirmed success. Never acknowledge before or merely after attempting a
+send. A nonzero monitor result can still contain events committed with
+`persistence.status: recorded`; surface the failure separately.
 If persistence is `not-established` and `possible_duplicate` is true, enqueue
 the candidate items with at-least-once semantics and tolerate a later duplicate;
 the task-file commit may already have suppressed them from future runs.
 After a delivery incident, inspect `last_results`; use `reset-seen` only when
 replaying every current match is intentional.
+
+## Delivery adapters
+
+Configure exactly one endpoint through the scheduler secret store, never argv:
+
+```text
+webhook -> XIANYU_WEBHOOK_URL
+bark    -> XIANYU_BARK_URL
+wecom   -> XIANYU_WECOM_WEBHOOK_URL
+```
+
+Preview every selected batch from an absolute task path:
+
+```bash
+.venv/bin/python scripts/xianyu.py deliver \
+  --data-file /absolute/private/path/tasks.json \
+  --adapter webhook \
+  --task-id TASK_ID \
+  --preview
+```
+
+After reviewing the redacted endpoint evidence and exact bodies, repeat with
+`--send --expected-preview-sha256 SHA256_FROM_PREVIEW`. The generic webhook
+receives the schema-1 outbox envelope and every adapter sends an
+`Idempotency-Key` header. Bark requires JSON `code: 200`; WeCom requires
+`errcode: 0` and receives plain text so listing content is not interpreted as
+Markdown; generic webhooks accept any 2xx response. Redirects and non-HTTPS
+endpoints fail closed. If `possible_duplicate` is true, inspect destination and
+outbox state before a new preview; never blind-retry the batch.
 
 For Windows Task Scheduler, use the absolute executable
 `C:\path\xianyu-monitor\.venv\Scripts\python.exe`, pass the absolute
@@ -253,9 +301,29 @@ details and must remain outside the portable core workflow.
 
 ## Upgrade strategy
 
+Before upgrading from v1, pause the scheduler, wait for active monitor/delivery
+runs to finish, and preserve the entire private task store plus the old runtime.
+`task export` omits state references, seen IDs, and pending outbox events; it is
+not a recovery backup. Read schema-1/2 tasks with the new runtime before enabling
+mutations; the next successful write upgrades the store to schema 3 while keeping
+definitions and seen IDs. Resume existing tasks without a new baseline.
+
+To roll back, pause scheduling again and preserve the current store separately.
+Reconcile any pending delivery events, then point the old runtime at the original
+backup, never at the schema-3 store. Old seen history may cause listings observed
+during the upgrade to reappear. Keep all backups private and outside the checkout.
+
 A symlink install tracks the checkout; update it with `git pull`, then reinstall
 runtime dependencies if `requirements.txt` changed. A copy install is a
 snapshot. Install a new copy into a clean target after reviewing changes rather
 than overwriting an unknown directory. Before deleting an old checkout, close
 any legacy CDP Chrome and use the guarded cleanup command above for each exact
 old initialized temporary profile.
+
+Run `python scripts/xianyu.py version` to identify a checkout or copy, then
+`python scripts/xianyu.py install --host HOST --check` for offline health. Copy
+health uses its private file-digest manifest; symlink health verifies that the
+selected link still resolves to the invoking checkout. `stale`, `modified`,
+`incomplete`, `unrecognized`, and `wrong-mode` are diagnostic only: the command
+never replaces, deletes, repairs, pulls, or checks a remote release. Install a
+reviewed new copy at a clean target and retire the old one separately.

@@ -3,10 +3,14 @@
 ## Contents
 
 - [Runtime flow](#runtime-flow)
+- [Offline demo](#offline-demo)
+- [Candidate preflight](#candidate-preflight)
 - [Login candidate evidence](#login-candidate-evidence)
 - [Search capture](#search-capture)
 - [Filtering and pagination](#filtering-and-pagination)
-- [Persistent monitoring](#persistent-monitoring)
+- [Optional AI analysis](#optional-ai-analysis)
+- [AI evaluation and feedback](#ai-evaluation-and-feedback)
+- [Persistent monitoring and delivery](#persistent-monitoring-and-delivery)
 - [Storage](#storage)
 - [Security boundaries](#security-boundaries)
 - [Host boundary](#host-boundary)
@@ -15,6 +19,12 @@
 
 `doctor.py` is a read-only preflight outside the collection data path. It checks
 runtime and browser availability without starting Playwright or reading state.
+`state_check.py` is a separate, explicitly authorized preflight that validates
+one candidate's file privacy and sanitized schema without launching a browser or
+emitting its path or contents.
+`setup.py` only composes these existing boundaries: it cannot install software,
+choose a search, overwrite state, or bypass browser confirmation. `version_info.py`
+and `install --check` provide offline discovery and health evidence.
 
 ```text
 User, Agent Skills host, or scheduler
@@ -30,27 +40,63 @@ User, Agent Skills host, or scheduler
           scripts/spider.py        scripts/task_manager.py
                  |                         |
                  v                         v
-        Playwright browser             tasks.json
+        Playwright browser      tasks.json + durable outbox
                  |
                  v
        Exact Xianyu PC search endpoint
                  |
                  v
        JSON and process exit status
-                 |
-                 v
-        Host-owned delivery adapter
+           /             \
+          v               v
+ optional analyze.py   optional deliver.py
+          |                    |
+          v                    v
+ OpenAI-compatible API   Bark/Webhook/WeCom
 ```
 
 `xianyu.py` adds no collection behavior: it selects one existing command in the
 same process and preserves its input/output, TTY, signal, and exit-code contract.
 `spider.py` is a one-shot deterministic data collector. `task_manager.py` owns
-task definitions and seen-item state. `monitor.py` joins them and returns only
-new items. The calling host owns scheduling and delivery. Direct module/script
+task definitions, seen-item state, portable transfers, and the local outbox.
+`monitor.py` joins them and returns only new items. The host owns scheduling and
+external delivery. Direct module/script
 entrypoints remain backward compatible.
 
-The scripts do not perform purchases, seller messaging, or external
-notifications.
+The runtime distribution allowlist is centralized in `distribution.py` and
+drives copy installation plus release manifest generation. `release_bundle.py`
+adds deterministic tar/gzip metadata, exact payload hashes, SPDX dependency
+evidence, canonical verification, and a clean exact-tag gate for publication.
+Repository documentation remains outside the minimal Skill bundle.
+
+The scripts do not perform purchases or seller messaging. Notification delivery
+is a separate, explicit, digest-gated command and is never part of collection.
+
+## Offline demo
+
+`demo.py` composes the production sanitizer, analysis validator, run-evidence
+hashing, golden evaluator, outbox key generation, and delivery-preview builder
+with immutable synthetic inputs. It does not invoke the browser, provider
+transport, delivery transport, task persistence, filesystem, or environment
+credentials. Its `synthetic` evidence prevents the walkthrough from being
+mistaken for authentication, collection, model-quality, or delivery proof.
+
+Release self-check runs the same demo from the verified extracted bundle and the
+empty-HOME copy installation and requires identical JSON. This catches missing
+bundle files, import drift, or installation mutation without touching live state.
+
+## Candidate preflight
+
+`state_check.py` reuses the search runtime's Goofish-only schema filter, but does
+not expose the sanitized values. It accepts only absolute paths, bounds file size,
+checks POSIX ownership/access, and compares file identity, size, and modification
+time across validation. Passing means only `candidate-valid`; a real one-page
+search is still required for `passed-for-this-run` capability evidence.
+On Windows Python 3.12, path stat preserves creation time in `ctime`, whereas
+handle fstat may expose change time (see [CPython's path-stat implementation](https://github.com/python/cpython/blob/v3.12.10/Modules/posixmodule.c)
+and [handle-stat implementation](https://github.com/python/cpython/blob/v3.12.10/Python/fileutils.c)).
+Cross-API checks use `st_birthtime_ns` when available; before/after comparisons
+from the same API still require unchanged ctime, identity, size, mtime, and mode.
 
 ## Login candidate evidence
 
@@ -126,8 +172,48 @@ The spider therefore:
 5. Applies inclusive price bounds and location substring matching locally.
 
 This design favors correct output over relying on unstable page filter widgets.
+Public and persisted inputs cap pages at 20 and attempts at 10. Normalized item
+links are constructed from item IDs on the canonical Goofish HTTPS origin; API
+deep links are treated as untrusted input and discarded.
 
-## Persistent monitoring
+## Optional AI analysis
+
+`analyze.py` is outside the browser, credential, task-persistence, and seen-ID
+commit boundaries. It accepts completed JSON output by default and requires
+either a no-network preview or explicit per-call external-send consent. Preview
+produces a SHA-256 over the exact provider endpoint, model, and request body;
+the live call must present the same digest before network access. Provider
+failure therefore cannot turn a failed search into success, roll back seen IDs,
+or alter task state.
+
+The analyzer applies a fixed allowlist before constructing the provider request.
+Browser state, Cookie, proxy, seller, image, original URL, paths, and unknown
+fields never cross this boundary. Input listing text and criteria remain
+untrusted data. The model has no tools and returns a strict schema; the runtime
+still validates item correlation, values, bounds, and completeness before
+locally restoring canonical URLs. Analysis output is advisory and cannot upgrade
+unknown authenticity, reputation, repair history, condition, or safety into
+observed evidence. Failed collection JSON is rejected unless the explicit
+retained mode selects only failed-monitor items already marked
+`persistence.status: recorded`; that output preserves failed source-run evidence.
+`not-established` items are never selected. Downstream hosts must continue
+treating every model-produced string as untrusted data, not instructions.
+
+The analyzer emits schema-1 run evidence: hashes of the provider identity,
+sanitized input, system prompt, response schema, exact request, and validated
+output, plus observed request latency. Hashes support comparison and provenance;
+they do not prove model quality.
+
+## AI evaluation and feedback
+
+`evaluate.py golden` compares expected labels and score bounds entirely offline.
+A failed regression is a valid evaluation result with exit `1`; malformed
+evidence exits `2`. `evaluate.py feedback` atomically creates one private record
+containing only the item ID, label, note, score/level, and run hashes. It excludes
+automatically copied listing title, URL, criteria, and free-form model evidence;
+the human-supplied note must remain nonsensitive.
+
+## Persistent monitoring and delivery
 
 Each monitor run loads all active tasks or one selected task. For every task it:
 
@@ -149,11 +235,15 @@ matches without reporting them as new. Without that flag, the first successful
 run treats all matches as new. `reset-seen` intentionally restores that
 behavior.
 
-Seen IDs are committed after collection succeeds and before any host-owned
-delivery step. This provides collection deduplication, not exactly-once message
-delivery. An adapter that needs durable delivery must atomically persist the
-monitor output before forwarding it and retry from that outbox on delivery
-failure. `last_results` supports inspection, while `reset-seen` deliberately
+Seen IDs and allowlisted outbox events are committed together after collection
+succeeds and before host-owned delivery. Stable keys support destination
+deduplication and at-least-once retries, not exactly-once external delivery. The
+host can list/ack manually or use `deliver.py`. Adapter preview binds the adapter,
+secret endpoint hash, selected event keys, and exact provider bodies. Send
+requires the matching digest, blocks redirects, and acknowledges each event only
+after an HTTP response satisfies the adapter success contract. Transport or ack
+ambiguity leaves the event pending and reports possible duplicate delivery.
+`last_results` supports inspection, while `reset-seen` deliberately
 replays all currently matched items and should be used only as an explicit
 recovery action.
 
@@ -172,11 +262,11 @@ preferable to permanently losing an item whose ID may already be committed.
 
 ## Storage
 
-`tasks.json` uses schema version 2:
+`tasks.json` uses schema version 3:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "updated_at": "2026-07-24T08:00:00+00:00",
   "tasks": [
     {
@@ -196,7 +286,8 @@ preferable to permanently losing an item whose ID may already be committed.
       "last_run": null,
       "last_error": null
     }
-  ]
+  ],
+  "outbox": []
 }
 ```
 
@@ -207,6 +298,11 @@ hard link; unsupported filesystems fail closed.
 Lock age and recorded PID never authorize automatic removal. Existing locks
 time out and require operator inspection, avoiding a stale-lock recovery race
 that could delete a new owner's lock.
+Inside the lock, every mutation captures the task file's identity, size, times,
+owner, mode, and content digest through the load descriptor, then verifies the
+same snapshot immediately before atomic replacement. A missing, newly appeared,
+replaced, or in-place changed store fails closed without publishing staged data;
+monitor does not write error metadata into the competing store.
 Task and state files use user-only permissions where the operating system
 supports them.
 
@@ -218,7 +314,10 @@ an absolute override is supplied, preventing an upgrade from silently selecting
 a different credential file. Operators can rotate a stable absolute state-file
 symlink without rewriting tasks.
 
-Old task entries are normalized with missing version-2 fields when loaded.
+Old task entries are normalized with missing fields when loaded. Portable export
+never includes state/history/outbox; import creates stopped tasks without state.
+`reset-seen` advances a delivery generation, so an intentional replay creates new
+idempotency keys instead of colliding with a pending earlier generation.
 Notification fields from older files are removed because delivery belongs to
 the calling host, not the task data model. Seen-item history keeps the latest
 50,000 IDs.
