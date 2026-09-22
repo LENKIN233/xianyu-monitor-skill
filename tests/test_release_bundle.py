@@ -55,7 +55,7 @@ def test_release_manifest_and_sbom_match_payload(tmp_path: Path) -> None:
 
 def test_release_verify_rejects_checksum_mismatch(tmp_path: Path) -> None:
     built = release_bundle.build_bundle(ROOT, tmp_path)
-    built.checksum.write_text(f"{'0' * 64}  {built.archive.name}\n")
+    built.checksum.write_bytes(f"{'0' * 64}  {built.archive.name}\n".encode("ascii"))
 
     with pytest.raises(release_bundle.ReleaseBundleError, match="checksum"):
         release_bundle.verify_bundle(built.archive, built.checksum)
@@ -70,7 +70,7 @@ def test_release_verify_rejects_path_traversal_archive(tmp_path: Path) -> None:
         output.addfile(info, io.BytesIO(payload))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     checksum = tmp_path / "unsafe.tar.gz.sha256"
-    checksum.write_text(f"{digest}  {archive.name}\n")
+    checksum.write_bytes(f"{digest}  {archive.name}\n".encode("ascii"))
 
     with pytest.raises(release_bundle.ReleaseBundleError, match="unsafe"):
         release_bundle.verify_bundle(archive, checksum)
@@ -92,7 +92,7 @@ def test_release_verify_rejects_noncanonical_archive(tmp_path: Path) -> None:
             output.addfile(info, io.BytesIO(payload))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     checksum = tmp_path / "noncanonical.tar.gz.sha256"
-    checksum.write_text(f"{digest}  {archive.name}\n")
+    checksum.write_bytes(f"{digest}  {archive.name}\n".encode("ascii"))
 
     with pytest.raises(release_bundle.ReleaseBundleError, match="canonical"):
         release_bundle.verify_bundle(archive, checksum)
