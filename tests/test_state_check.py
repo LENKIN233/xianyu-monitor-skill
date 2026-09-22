@@ -1,0 +1,285 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+import state_check
+
+
+def _write_state(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "session",
+                        "value": "candidate",
+                        "domain": ".goofish.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        path.chmod(0o600)
+
+
+def test_state_check_accepts_private_candidate_without_echoing_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state_file = tmp_path / "private-state.json"
+    _write_state(state_file)
+
+    assert state_check.main(["--state", str(state_file)]) == 0
+    output = capsys.readouterr().out
+    report = json.loads(output)
+
+    assert str(state_file) not in output
+    assert report["ok"] is True
+    assert report["state"] == {"status": "candidate-valid"}
+    assert report["search_capability"] == {"status": "not-tested"}
+    assert report["next_action"]["code"] == "run-controlled-search"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires privileges")
+def test_state_check_accepts_stable_symlink_to_private_candidate(
+    tmp_path: Path,
+) -> None:
+    state_file = tmp_path / "private-state.json"
+    state_link = tmp_path / "state-link.json"
+    _write_state(state_file)
+    state_link.symlink_to(state_file)
+
+    report = state_check.inspect_state(state_link)
+
+    assert report["ok"] is True
+    assert report["privacy"]["status"] == "passed"
+    assert report["state"] == {"status": "candidate-valid"}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires privileges")
+def test_state_check_rejects_symlink_target_rotation_during_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    state_link = tmp_path / "state-link.json"
+    _write_state(first)
+    _write_state(second)
+    second.chmod(0o644)
+    state_link.symlink_to(first)
+    original_validator = state_check._validate_state_payload
+
+    def rotate_after_validation(payload: bytes) -> None:
+        original_validator(payload)
+        state_link.unlink()
+        state_link.symlink_to(second)
+
+    monkeypatch.setattr(
+        state_check,
+        "_validate_state_payload",
+        rotate_after_validation,
+    )
+
+    report = state_check.inspect_state(state_link)
+
+    assert report["ok"] is False
+    assert report["error_type"] == "StateChangedError"
+    assert report["next_action"]["code"] == "retry-state-check"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink and POSIX mode coverage")
+def test_state_check_rechecks_stable_symlink_target_mode_at_return_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_file = tmp_path / "private-state.json"
+    state_link = tmp_path / "state-link.json"
+    _write_state(state_file)
+    state_link.symlink_to(state_file)
+    original_inspector = state_check._inspect_open_state
+
+    def expose_after_inspection(
+        stream: object,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        result = original_inspector(stream)  # type: ignore[arg-type]
+        state_file.chmod(0o644)
+        return result
+
+    monkeypatch.setattr(state_check, "_inspect_open_state", expose_after_inspection)
+
+    report = state_check.inspect_state(state_link)
+
+    assert report["ok"] is False
+    assert report["privacy"]["status"] == "failed"
+    assert report["error_type"] == "StatePrivacyError"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink and POSIX metadata coverage")
+def test_state_check_rechecks_stable_symlink_target_content_at_return_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_file = tmp_path / "private-state.json"
+    state_link = tmp_path / "state-link.json"
+    _write_state(state_file)
+    state_link.symlink_to(state_file)
+    original_inspector = state_check._inspect_open_state
+
+    def mutate_after_inspection(
+        stream: object,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        result = original_inspector(stream)  # type: ignore[arg-type]
+        current = state_file.read_text(encoding="utf-8")
+        state_file.write_text(
+            current.replace("candidate", "substitute"), encoding="utf-8"
+        )
+        state_file.chmod(0o600)
+        return result
+
+    monkeypatch.setattr(state_check, "_inspect_open_state", mutate_after_inspection)
+
+    report = state_check.inspect_state(state_link)
+
+    assert report["ok"] is False
+    assert report["error_type"] == "StateChangedError"
+    assert report["next_action"]["code"] == "retry-state-check"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode coverage")
+def test_state_check_rechecks_mode_on_same_open_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_file = tmp_path / "private-state.json"
+    _write_state(state_file)
+    original_validator = state_check._validate_state_payload
+
+    def expose_after_validation(payload: bytes) -> None:
+        original_validator(payload)
+        state_file.chmod(0o640)
+
+    monkeypatch.setattr(state_check, "_validate_state_payload", expose_after_validation)
+
+    report = state_check.inspect_state(state_file)
+
+    assert report["ok"] is False
+    assert report["privacy"]["status"] == "failed"
+    assert report["error_type"] == "StatePrivacyError"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ctime coverage")
+def test_state_check_rejects_ctime_change_even_when_private_mode_is_restored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_file = tmp_path / "private-state.json"
+    _write_state(state_file)
+    original_validator = state_check._validate_state_payload
+
+    def change_and_restore_mode(payload: bytes) -> None:
+        original_validator(payload)
+        state_file.chmod(0o640)
+        state_file.chmod(0o600)
+
+    monkeypatch.setattr(
+        state_check,
+        "_validate_state_payload",
+        change_and_restore_mode,
+    )
+
+    report = state_check.inspect_state(state_file)
+
+    assert report["ok"] is False
+    assert report["state"] == {"status": "not-established"}
+    assert report["error_type"] == "StateChangedError"
+    assert report["next_action"]["code"] == "retry-state-check"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode coverage")
+def test_state_check_rejects_group_readable_candidate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state_file = tmp_path / "private-state.json"
+    _write_state(state_file)
+    state_file.chmod(0o640)
+
+    assert state_check.main(["--state", str(state_file)]) == 2
+    output = capsys.readouterr().out
+    report = json.loads(output)
+
+    assert str(state_file) not in output
+    assert report["state"] == {"status": "not-inspected"}
+    assert report["privacy"]["status"] == "failed"
+    assert report["next_action"]["code"] == "fix-state-permissions"
+
+
+def test_state_check_rejects_malformed_candidate_without_echoing_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state_file = tmp_path / "private-state.json"
+    state_file.write_text("{}\n", encoding="utf-8")
+    if os.name != "nt":
+        state_file.chmod(0o600)
+
+    assert state_check.main(["--state", str(state_file)]) == 2
+    output = capsys.readouterr().out
+    report = json.loads(output)
+
+    assert str(state_file) not in output
+    assert report["state"] == {"status": "invalid"}
+    assert report["error_type"] == "StateFileError"
+    assert report["next_action"]["code"] == "capture-or-import-state"
+
+
+def test_state_check_rejects_deeply_nested_json_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state_file = tmp_path / "deep-state.json"
+    state_file.write_text("[" * 100_000 + "0" + "]" * 100_000, encoding="utf-8")
+    if os.name != "nt":
+        state_file.chmod(0o600)
+
+    assert state_check.main(["--state", str(state_file)]) == 2
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["error_type"] == "StateFileError"
+    assert report["state"] == {"status": "invalid"}
+
+
+def test_state_check_missing_candidate_does_not_echo_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state_file = tmp_path / "missing-private-state.json"
+
+    assert state_check.main(["--state", str(state_file)]) == 2
+    output = capsys.readouterr().out
+    report = json.loads(output)
+
+    assert str(state_file) not in output
+    assert report["ok"] is False
+    assert report["state"] == {"status": "not-established"}
+    assert report["error_type"] == "StateAccessError"
+    assert report["next_action"]["code"] == "capture-or-import-state"
+
+
+def test_state_parser_requires_absolute_path(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        state_check.main(["--state", "relative.json"])
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["error_type"] == "ArgumentError"
+    assert "absolute" in report["error"]

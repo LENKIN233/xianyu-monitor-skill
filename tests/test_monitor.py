@@ -48,6 +48,11 @@ def test_monitor_persists_seen_items(tmp_path: Path, monkeypatch: Any) -> None:
     assert second[0]["new_count"] == 0
     assert first[0]["search_capability"]["status"] == "passed-for-this-run"
     assert first[0]["persistence"]["status"] == "recorded"
+    assert first[0]["outbox"]["status"] == "recorded-with-task"
+    assert first[0]["outbox"]["event_count"] == 1
+    assert len(first[0]["outbox"]["idempotency_keys"][0]) == 64
+    assert second[0]["outbox"]["event_count"] == 0
+    assert len(TaskManager(str(tasks_file)).list_outbox()) == 1
     assert first[0]["authentication"]["status"] == "not-evaluated"
     assert first[0]["identity"]["status"] == "not-evaluated"
 
@@ -138,6 +143,33 @@ def test_run_tasks_rejects_programmatic_cdp_before_task_file_access(
         asyncio.run(monitor.run_tasks(args))
 
 
+def test_monitor_fails_if_task_file_disappears_during_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tasks_file = tmp_path / "tasks.json"
+    TaskManager(str(tasks_file)).create_task("test")
+    real_manager = monitor.TaskManager
+
+    def disappearing_manager(
+        data_file: str,
+        *,
+        allow_missing: bool = True,
+    ) -> TaskManager:
+        manager = real_manager(data_file, allow_missing=allow_missing)
+        Path(data_file).unlink()
+        return manager
+
+    monkeypatch.setattr(monitor, "TaskManager", disappearing_manager)
+
+    assert monitor.main(["--tasks-file", str(tasks_file)]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["error_code"] == "create-task-file"
+    assert report["next_action"]["code"] == "create-task-file"
+    assert report["tasks"] == []
+
+
 def test_malformed_proxy_credentials_never_reach_output_or_task_file(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -197,6 +229,8 @@ def test_monitor_baseline_suppresses_existing_items(
     assert reports[0]["new_count"] == 0
     assert reports[0]["baseline_count"] == 1
     assert reports[0]["items"] == []
+    assert reports[0]["outbox"]["event_count"] == 0
+    assert TaskManager(str(tasks_file)).list_outbox() == []
 
 
 def test_persistence_failure_preserves_successful_search_evidence(
@@ -548,6 +582,47 @@ def test_interrupt_after_record_run_return_uses_external_commit_progress(
     assert stored["seen_item_ids"] == ["new-1"]
 
 
+def test_interrupt_after_success_report_publish_retains_committed_items(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    tasks_file = tmp_path / "tasks.json"
+    manager = TaskManager(str(tasks_file))
+    task = manager.create_task("测试")
+    monkeypatch.setattr(monitor, "XianyuSpider", FakeSpider)
+    gate_calls = 0
+
+    def cancel_after_full_report_is_published() -> None:
+        nonlocal gate_calls
+        gate_calls += 1
+        if gate_calls == 4:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        monitor,
+        "_raise_if_task_cancelling",
+        cancel_after_full_report_is_published,
+    )
+
+    assert monitor.main(["--tasks-file", str(tasks_file)]) == 130
+    payload = json.loads(capsys.readouterr().out)
+
+    assert gate_calls == 4
+    assert payload["new_count"] == 1
+    report = payload["tasks"][0]
+    assert report["persistence"] == {"status": "recorded"}
+    assert report["new_count"] == 1
+    assert report["items"] == [{"id": "new-1", "title": "新商品", "price": 100}]
+    assert report["interruption"] == {
+        "status": "cancelled-after-task-commit",
+        "error_type": "KeyboardInterrupt",
+    }
+    stored = TaskManager(str(tasks_file)).get_task(task["id"])
+    assert stored is not None
+    assert stored["seen_item_ids"] == ["new-1"]
+
+
 @pytest.mark.skipif(
     not hasattr(signal, "raise_signal"),
     reason="signal.raise_signal is required",
@@ -670,6 +745,43 @@ def test_post_commit_finalization_error_retains_items_and_stops_batch(
     stored = TaskManager(str(tasks_file)).get_task(first_task["id"])
     assert stored is not None
     assert stored["seen_item_ids"] == ["new-1"]
+
+
+def test_monitor_never_overwrites_task_store_replaced_after_mutation_load(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    tasks_file = tmp_path / "tasks.json"
+    manager = TaskManager(str(tasks_file))
+    manager.create_task("test")
+    replacement = b'{"schema_version":2,"replacement_marker":true,"tasks":[]}\n'
+    real_save = TaskManager._save
+    replaced = False
+
+    def replace_before_save(
+        instance: TaskManager,
+        **kwargs: Any,
+    ) -> None:
+        nonlocal replaced
+        if not replaced:
+            tasks_file.write_bytes(replacement)
+            replaced = True
+        real_save(instance, **kwargs)
+
+    monkeypatch.setattr(monitor, "XianyuSpider", FakeSpider)
+    monkeypatch.setattr(TaskManager, "_save", replace_before_save)
+
+    assert monitor.main(["--tasks-file", str(tasks_file)]) == 2
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["ok"] is False
+    report = payload["tasks"][0]
+    assert report["persistence"] == {"status": "not-recorded"}
+    assert report["error_recording"] == {"status": "not-attempted"}
+    assert report["error_code"] == "task-store-changed"
+    assert report["next_action"]["code"] == "inspect-task-store"
+    assert tasks_file.read_bytes() == replacement
 
 
 @pytest.mark.parametrize(
@@ -1182,6 +1294,8 @@ def test_missing_task_file_is_never_a_silent_success(
     assert payload["ok"] is False
     assert payload["error_type"] == "ValueError"
     assert "task file does not exist" in payload["error"]
+    assert payload["error_code"] == "create-task-file"
+    assert payload["next_action"]["code"] == "create-task-file"
     assert payload["task_count"] == 0
     assert payload["new_count"] == 0
     assert payload["tasks"] == []
@@ -1189,6 +1303,65 @@ def test_missing_task_file_is_never_a_silent_success(
     assert payload["authentication"]["status"] == "not-evaluated"
     assert payload["identity"]["status"] == "not-evaluated"
     assert payload["cleanup"]["status"] == "complete-or-not-required"
+
+
+def test_stopped_task_error_explains_recovery(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    class UnexpectedSpider:
+        def __init__(self, *_args: Any, **_kwargs: Any):
+            raise AssertionError("preflight failure must not open a browser")
+
+    tasks_file = tmp_path / "tasks.json"
+    manager = TaskManager(str(tasks_file))
+    task = manager.create_task("测试")
+    manager.set_status(task["id"], "stopped")
+    monkeypatch.setattr(monitor, "XianyuSpider", UnexpectedSpider)
+
+    result = monitor.main(["--tasks-file", str(tasks_file), "--task-id", task["id"]])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 2
+    assert payload["error_code"] == "resume-task"
+    assert payload["next_action"]["code"] == "resume-task"
+
+
+def test_legacy_unbounded_task_is_rejected_before_browser_start(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    class UnexpectedSpider:
+        def __init__(self, *_args: Any, **_kwargs: Any):
+            raise AssertionError("safety preflight must not open a browser")
+
+    tasks_file = tmp_path / "tasks.json"
+    tasks_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "tasks": [
+                    {
+                        "id": "task_legacy_unbounded",
+                        "keyword": "测试",
+                        "pages": 21,
+                        "retries": 11,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(monitor, "XianyuSpider", UnexpectedSpider)
+
+    result = monitor.main(["--tasks-file", str(tasks_file)])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 2
+    assert payload["error_code"] == "recreate-bounded-task"
+    assert payload["next_action"]["code"] == "recreate-bounded-task"
 
 
 def test_monitor_cancellation_is_structured(
@@ -1255,6 +1428,32 @@ def test_cancellation_while_building_success_output_retains_committed_reports(
     assert payload["new_count"] == 1
     assert payload["tasks"] == [report]
     assert payload["search_capability"]["status"] == "passed-for-this-run"
+
+
+def test_batch_cancellation_retains_unappended_committed_current_report() -> None:
+    report = {
+        "ok": True,
+        "task_id": "task_done",
+        "keyword": "done",
+        "new_count": 1,
+        "items": [{"id": "new-1"}],
+        "search_capability": {"status": "passed-for-this-run"},
+        "persistence": {"status": "recorded"},
+    }
+    progress = monitor.MonitorRunProgress(
+        current_report=report,
+        current_capability_status="passed-for-this-run",
+    )
+
+    retained = progress.cancellation_reports(KeyboardInterrupt())
+
+    assert retained[0]["ok"] is True
+    assert retained[0]["new_count"] == 1
+    assert retained[0]["items"] == [{"id": "new-1"}]
+    assert retained[0]["interruption"] == {
+        "status": "cancelled-after-task-commit",
+        "error_type": "KeyboardInterrupt",
+    }
 
 
 def test_cleanup_cancellation_stops_before_later_tasks(

@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import ctypes
 import errno
+import hashlib
 import json
 import os
 import secrets
@@ -14,47 +15,38 @@ import shutil
 import stat
 import sys
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+sys.dont_write_bytecode = True
 
 if __package__:
     from .cli_contract import JsonArgumentParser, sigterm_cancellable
+    from .distribution import (
+        BUNDLE_FILES,
+        INSTALL_MANIFEST,
+        OPTIONAL_PROVENANCE_FILES,
+    )
+    from .version_info import read_version
 else:
     from cli_contract import JsonArgumentParser, sigterm_cancellable
+    from distribution import BUNDLE_FILES, INSTALL_MANIFEST, OPTIONAL_PROVENANCE_FILES
+    from version_info import read_version
 
 SKILL_NAME = "xianyu-monitor"
+INSTALL_MANIFEST_SCHEMA = 1
+MAX_DISTRIBUTABLE_FILE_BYTES = 16 * 1024 * 1024
+MAX_INSTALL_MANIFEST_BYTES = 2 * 1024 * 1024
 HOST_ROOTS = {
     "codex": Path(".agents/skills"),
     "claude": Path(".claude/skills"),
     # Current OpenClaw releases also discover the shared Agent Skills root.
     "openclaw": Path(".agents/skills"),
 }
-REQUIRED_COPY_FILES = (
-    "LICENSE",
-    "references/api_reference.md",
-    "references/architecture.md",
-    "references/host_adapters.md",
-    "requirements.txt",
-    "scripts/__init__.py",
-    "scripts/cdp_profile.py",
-    "scripts/cli_contract.py",
-    "scripts/create_state.py",
-    "scripts/doctor.py",
-    "scripts/install_skill.py",
-    "scripts/login_state.py",
-    "scripts/monitor.py",
-    "scripts/spider.py",
-    "scripts/task_manager.py",
-    "scripts/xianyu.py",
-    "SKILL.md",
-)
-OPTIONAL_COPY_FILES = ("agents/openai.yaml",)
-COPY_FILES = (
-    *OPTIONAL_COPY_FILES,
-    *REQUIRED_COPY_FILES,
-)
+REQUIRED_COPY_FILES = BUNDLE_FILES
+COPY_FILES = (*BUNDLE_FILES, *OPTIONAL_PROVENANCE_FILES)
 
 
 @dataclass
@@ -181,6 +173,101 @@ def _validate_staged_copy(staging: Path) -> None:
     ]
     if missing_staged:
         raise ValueError(f"missing required staged resource: {missing_staged[0]}")
+
+
+def _read_regular_file(path: Path, *, maximum: int) -> bytes:
+    """Read one bounded regular non-symlink file for distribution evidence."""
+
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ValueError("distributable resource is missing or inaccessible") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("distributable resources must be regular non-symlink files")
+    if metadata.st_size > maximum:
+        raise ValueError("distributable resource exceeds the safety limit")
+    try:
+        with path.open("rb") as stream:
+            payload = stream.read(maximum + 1)
+    except OSError as exc:
+        raise ValueError("distributable resource is unreadable") from exc
+    if len(payload) > maximum:
+        raise ValueError("distributable resource exceeds the safety limit")
+    return payload
+
+
+def _validate_source_payload(source: Path) -> None:
+    provenance_present = {
+        relative_name
+        for relative_name in OPTIONAL_PROVENANCE_FILES
+        if _path_exists(source / relative_name)
+    }
+    if provenance_present and provenance_present != set(OPTIONAL_PROVENANCE_FILES):
+        raise ValueError("release provenance must be complete or absent")
+    for relative_name in BUNDLE_FILES:
+        _read_regular_file(
+            source / relative_name,
+            maximum=MAX_DISTRIBUTABLE_FILE_BYTES,
+        )
+    for relative_name in provenance_present:
+        _read_regular_file(
+            source / relative_name,
+            maximum=MAX_DISTRIBUTABLE_FILE_BYTES,
+        )
+
+
+def _install_manifest_payload(staging: Path) -> dict[str, Any]:
+    files = []
+    recorded_files = [
+        *BUNDLE_FILES,
+        *(
+            relative_name
+            for relative_name in OPTIONAL_PROVENANCE_FILES
+            if (staging / relative_name).is_file()
+        ),
+    ]
+    for relative_name in recorded_files:
+        payload = _read_regular_file(
+            staging / relative_name,
+            maximum=MAX_DISTRIBUTABLE_FILE_BYTES,
+        )
+        files.append(
+            {
+                "path": relative_name,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            }
+        )
+    return {
+        "schema_version": INSTALL_MANIFEST_SCHEMA,
+        "skill": {"name": SKILL_NAME, "version": read_version(staging)},
+        "files": files,
+    }
+
+
+def _write_install_manifest(staging: Path) -> None:
+    payload = (
+        json.dumps(
+            _install_manifest_payload(staging),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("ascii")
+        + b"\n"
+    )
+    destination = staging / INSTALL_MANIFEST
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(destination, flags, stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _capture_target_ownership(
@@ -491,6 +578,7 @@ def _copy_skill(
             shutil.copy2(source_entry, target_entry)
 
         _validate_staged_copy(temporary)
+        _write_install_manifest(temporary)
         publish_attempted = True
         _publish_staged_target(
             temporary,
@@ -903,6 +991,7 @@ def install_skill(
     ]
     if missing_resources:
         raise ValueError(f"missing required skill resource: {missing_resources[0]}")
+    _validate_source_payload(source)
     if mode not in {"symlink", "copy"}:
         raise ValueError("mode must be 'symlink' or 'copy'")
     if not hosts:
@@ -1110,6 +1199,301 @@ def install_skill(
     return records
 
 
+def _recognized_skill_root(target: Path) -> bool:
+    try:
+        return _read_skill_name(target / "SKILL.md") == SKILL_NAME
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def _load_install_manifest(target: Path) -> dict[str, Any] | None:
+    manifest_path = target / INSTALL_MANIFEST
+    try:
+        payload = _read_regular_file(
+            manifest_path,
+            maximum=MAX_INSTALL_MANIFEST_BYTES,
+        )
+    except ValueError:
+        return None
+    try:
+        manifest = json.loads(payload.decode("ascii"))
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ):
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
+def _manifest_file_hashes(
+    manifest: dict[str, Any],
+) -> dict[str, tuple[str, int]] | None:
+    if manifest.get("schema_version") != INSTALL_MANIFEST_SCHEMA:
+        return None
+    skill = manifest.get("skill")
+    if not isinstance(skill, dict) or skill.get("name") != SKILL_NAME:
+        return None
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        return None
+    observed: dict[str, tuple[str, int]] = {}
+    for record in files:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "size"}:
+            return None
+        relative_name = record.get("path")
+        digest = record.get("sha256")
+        size = record.get("size")
+        if (
+            not isinstance(relative_name, str)
+            or relative_name in observed
+            or relative_name not in {*BUNDLE_FILES, *OPTIONAL_PROVENANCE_FILES}
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or size > MAX_DISTRIBUTABLE_FILE_BYTES
+        ):
+            return None
+        observed[relative_name] = (digest, size)
+    if not set(BUNDLE_FILES) <= set(observed):
+        return None
+    present_provenance = set(observed) & set(OPTIONAL_PROVENANCE_FILES)
+    if present_provenance and present_provenance != set(OPTIONAL_PROVENANCE_FILES):
+        return None
+    return observed
+
+
+def _source_payload_hashes(source: Path) -> dict[str, tuple[str, int]]:
+    _validate_source_payload(source)
+    relative_names = [
+        *BUNDLE_FILES,
+        *(
+            relative_name
+            for relative_name in OPTIONAL_PROVENANCE_FILES
+            if _path_exists(source / relative_name)
+        ),
+    ]
+    hashes: dict[str, tuple[str, int]] = {}
+    for relative_name in relative_names:
+        payload = _read_regular_file(
+            source / relative_name,
+            maximum=MAX_DISTRIBUTABLE_FILE_BYTES,
+        )
+        hashes[relative_name] = (hashlib.sha256(payload).hexdigest(), len(payload))
+    return hashes
+
+
+def _installed_tree_is_exact(
+    target: Path,
+    hashes: Mapping[str, tuple[str, int]],
+) -> bool:
+    expected_files = {*hashes, INSTALL_MANIFEST}
+    expected_directories = {
+        PurePosixPath(*PurePosixPath(relative_name).parts[:depth]).as_posix()
+        for relative_name in expected_files
+        for depth in range(1, len(PurePosixPath(relative_name).parts))
+    }
+    pending = [target]
+    while pending:
+        directory = pending.pop()
+        try:
+            children = list(directory.iterdir())
+        except OSError:
+            return False
+        for child in children:
+            try:
+                metadata = child.lstat()
+                relative_name = child.relative_to(target).as_posix()
+            except (OSError, ValueError):
+                return False
+            if stat.S_ISLNK(metadata.st_mode):
+                return False
+            if stat.S_ISDIR(metadata.st_mode):
+                if PurePosixPath(relative_name).parts[0] == ".venv":
+                    continue
+                if relative_name not in expected_directories:
+                    return False
+                pending.append(child)
+            elif (
+                not stat.S_ISREG(metadata.st_mode)
+                or relative_name not in expected_files
+            ):
+                return False
+    return True
+
+
+def _copy_health(
+    target: Path,
+    source: Path,
+    expected_version: str,
+) -> tuple[str, str | None]:
+    if not _recognized_skill_root(target):
+        return "unrecognized", None
+    try:
+        installed_version = read_version(target)
+    except ValueError:
+        return "incomplete", None
+    manifest = _load_install_manifest(target)
+    if manifest is None:
+        return "incomplete", installed_version
+    hashes = _manifest_file_hashes(manifest)
+    skill = manifest.get("skill")
+    if hashes is None or not isinstance(skill, dict):
+        return "modified", installed_version
+    if skill.get("version") != installed_version:
+        return "modified", installed_version
+    if not _installed_tree_is_exact(target, hashes):
+        return "modified", installed_version
+    recorded_provenance = set(hashes) & set(OPTIONAL_PROVENANCE_FILES)
+    actual_provenance = {
+        relative_name
+        for relative_name in OPTIONAL_PROVENANCE_FILES
+        if _path_exists(target / relative_name)
+    }
+    if recorded_provenance != actual_provenance:
+        return "modified", installed_version
+    for relative_name, (expected_digest, expected_size) in hashes.items():
+        try:
+            payload = _read_regular_file(
+                target / relative_name,
+                maximum=MAX_DISTRIBUTABLE_FILE_BYTES,
+            )
+        except ValueError:
+            return "modified", installed_version
+        if len(payload) != expected_size or not secrets.compare_digest(
+            hashlib.sha256(payload).hexdigest(),
+            expected_digest,
+        ):
+            return "modified", installed_version
+    try:
+        source_hashes = _source_payload_hashes(source)
+    except (OSError, ValueError):
+        return "not-established", installed_version
+    if source_hashes != hashes:
+        return "stale", installed_version
+    if installed_version != expected_version:
+        return "stale", installed_version
+    return "current", installed_version
+
+
+def _symlink_health(
+    target: Path,
+    source: Path,
+    expected_version: str,
+) -> tuple[str, str | None]:
+    try:
+        resolved = target.resolve(strict=True)
+    except OSError:
+        return "unrecognized", None
+    if not resolved.is_dir() or not _recognized_skill_root(resolved):
+        return "unrecognized", None
+    try:
+        installed_version = read_version(resolved)
+    except ValueError:
+        return "incomplete", None
+    if installed_version != expected_version:
+        return "stale", installed_version
+    if resolved != source:
+        return "unrecognized", installed_version
+    try:
+        _validate_source_payload(resolved)
+    except ValueError:
+        return "incomplete", installed_version
+    return "current", installed_version
+
+
+def check_installations(
+    *,
+    source: Path,
+    home: Path,
+    hosts: list[str],
+    expected_mode: str | None = None,
+) -> list[dict[str, Any]]:
+    """Inspect selected discovery targets without writing or exposing paths."""
+
+    source = source.expanduser().resolve()
+    home = home.expanduser().resolve()
+    expected_version = read_version(source)
+    invalid_hosts = set(hosts) - {*HOST_ROOTS, "all"}
+    if invalid_hosts:
+        raise ValueError(f"unknown host: {sorted(invalid_hosts)[0]}")
+    if expected_mode not in {None, "copy", "symlink"}:
+        raise ValueError("expected mode must be copy, symlink, or unspecified")
+
+    records: list[dict[str, Any]] = []
+    for selection in _selected_targets(hosts, home):
+        target = selection["target"]
+        try:
+            metadata = target.lstat()
+        except FileNotFoundError:
+            status = "absent"
+            detected_mode = "absent"
+            installed_version = None
+        except OSError:
+            status = "not-established"
+            detected_mode = "not-established"
+            installed_version = None
+        else:
+            if stat.S_ISLNK(metadata.st_mode):
+                detected_mode = "symlink"
+                status, installed_version = _symlink_health(
+                    target,
+                    source,
+                    expected_version,
+                )
+            elif stat.S_ISDIR(metadata.st_mode):
+                detected_mode = "copy"
+                status, installed_version = _copy_health(
+                    target,
+                    source,
+                    expected_version,
+                )
+            else:
+                detected_mode = "other"
+                status = "unrecognized"
+                installed_version = None
+            if expected_mode is not None and detected_mode != expected_mode:
+                status = "wrong-mode"
+
+        record: dict[str, Any] = {
+            "hosts": list(selection["hosts"]),
+            "status": status,
+            "mode": detected_mode,
+            "expected_version": expected_version,
+        }
+        if expected_mode is not None:
+            record["expected_mode"] = expected_mode
+        if installed_version is not None:
+            record["installed_version"] = installed_version
+        records.append(record)
+    return records
+
+
+def _health_next_action(records: Sequence[dict[str, Any]]) -> dict[str, str]:
+    statuses = {str(record["status"]) for record in records}
+    if statuses == {"current"}:
+        return {
+            "code": "ready",
+            "hint": "Selected Skill installations match this release.",
+        }
+    if "absent" in statuses:
+        return {
+            "code": "preview-install",
+            "hint": "Preview an install with --dry-run before writing any target.",
+        }
+    return {
+        "code": "inspect-existing-install",
+        "hint": (
+            "Inspect the selected existing installation; this command never "
+            "overwrites, removes, repairs, or updates it."
+        ),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = JsonArgumentParser(
         description="Install xianyu-monitor into Agent Skills discovery roots"
@@ -1123,8 +1507,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         choices=("symlink", "copy"),
-        default="symlink",
-        help="link to this checkout or copy distributable files",
+        help=(
+            "link to this checkout or copy distributable files; defaults to "
+            "symlink for install and means any mode for --check"
+        ),
     )
     parser.add_argument(
         "--home",
@@ -1132,21 +1518,73 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path.home(),
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--dry-run", action="store_true")
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument("--dry-run", action="store_true")
+    action_group.add_argument(
+        "--check",
+        action="store_true",
+        help="inspect installation health without writing or checking the network",
+    )
     return parser
 
 
 @sigterm_cancellable
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    progress = InstallProgress(mode=args.mode, dry_run=args.dry_run)
+    mode = args.mode or "symlink"
+    if args.check:
+        try:
+            records = check_installations(
+                source=Path(__file__).resolve().parents[1],
+                home=args.home,
+                hosts=args.host or ["all"],
+                expected_mode=args.mode,
+            )
+            healthy = bool(records) and all(
+                record["status"] == "current" for record in records
+            )
+            print(
+                json.dumps(
+                    {
+                        "ok": healthy,
+                        "check": "offline-installation-health",
+                        "installs": records,
+                        "next_action": _health_next_action(records),
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                    allow_nan=False,
+                )
+            )
+            return 0 if healthy else 2  # noqa: TRY300 - protected JSON emission
+        except (OSError, ValueError) as exc:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "installation health could not be established",
+                        "error_type": type(exc).__name__,
+                        "next_action": {
+                            "code": "rerun-install-check",
+                            "hint": (
+                                "Inspect the selected local installation and rerun "
+                                "the offline health check."
+                            ),
+                        },
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return 2
+
+    progress = InstallProgress(mode=mode, dry_run=args.dry_run)
     try:
         source = Path(__file__).resolve().parents[1]
         records = install_skill(
             source=source,
             home=args.home,
             hosts=args.host or ["all"],
-            mode=args.mode,
+            mode=mode,
             dry_run=args.dry_run,
             progress=progress,
         )

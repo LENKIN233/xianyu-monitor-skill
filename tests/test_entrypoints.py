@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 import xianyu
+from distribution import BUNDLE_FILES
+from version_info import CAPABILITIES
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -82,8 +84,31 @@ def test_unified_cli_help_from_foreign_working_directory(tmp_path: Path) -> None
     )
 
     assert result.returncode == 0
-    for command in ("doctor", "login", "search", "task", "monitor", "install"):
+    for command in (
+        "version",
+        "demo",
+        "setup",
+        "doctor",
+        "state",
+        "login",
+        "search",
+        "analyze",
+        "evaluate",
+        "task",
+        "monitor",
+        "deliver",
+        "install",
+    ):
         assert command in result.stdout
+
+
+def test_command_capabilities_and_distribution_cannot_drift() -> None:
+    capability_commands = {str(item["command"]) for item in CAPABILITIES}
+    assert capability_commands == set(xianyu.COMMANDS)
+    assert {
+        f"scripts/{module_name}.py"
+        for module_name, _description in xianyu.COMMANDS.values()
+    } <= set(BUNDLE_FILES)
 
 
 def test_unified_module_entrypoint_from_skill_root() -> None:
@@ -104,11 +129,18 @@ def test_unified_cli_delegates_command_help_from_foreign_working_directory(
     tmp_path: Path,
 ) -> None:
     expected_options = {
+        "version": "--short",
+        "demo": "deterministic offline",
+        "setup": "--state",
         "doctor": "--state-output-dir",
+        "state": "--state",
         "login": "--confirm-in-browser",
         "search": "--keyword",
+        "analyze": "--consent-send-listings",
+        "evaluate": "feedback",
         "task": "--data-file",
         "monitor": "--tasks-file",
+        "deliver": "--adapter",
         "install": "--host",
     }
 

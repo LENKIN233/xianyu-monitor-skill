@@ -43,6 +43,8 @@ except ImportError:  # Keep the module importable for setup/help commands.
 
 if __package__:
     from .cli_contract import (
+        MAX_SEARCH_PAGES,
+        MAX_SEARCH_RETRIES,
         RAW_CDP_DISABLED_MESSAGE,
         JsonArgumentParser,
         reject_raw_cdp_path,
@@ -50,6 +52,8 @@ if __package__:
     )
 else:
     from cli_contract import (
+        MAX_SEARCH_PAGES,
+        MAX_SEARCH_RETRIES,
         RAW_CDP_DISABLED_MESSAGE,
         JsonArgumentParser,
         reject_raw_cdp_path,
@@ -68,6 +72,7 @@ NEXT_PAGE_SELECTOR = (
 )
 DEFAULT_TIMEOUT_MS = 30_000
 PAGINATION_WAIT_MS = 5_000
+MAX_STATE_BYTES = 64 * 1024 * 1024
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 CDP_PROFILE_SENTINEL_NAME = ".xianyu-monitor-cdp-profile"
 CDP_PROFILE_SENTINEL_VALUE = "xianyu-monitor dedicated cdp profile v1\n"
@@ -860,7 +865,11 @@ def _filter_goofish_storage_state(state: Any) -> dict[str, Any]:
                     raise StorageStateValidationError("browser state cookie is invalid")
                 clean_cookie[field] = cookie[field]
         if "sameSite" in cookie:
-            if cookie["sameSite"] not in {"Lax", "None", "Strict"}:
+            if not isinstance(cookie["sameSite"], str) or cookie["sameSite"] not in {
+                "Lax",
+                "None",
+                "Strict",
+            }:
                 raise StorageStateValidationError("browser state cookie is invalid")
             clean_cookie["sameSite"] = cookie["sameSite"]
         filtered_cookies.append(clean_cookie)
@@ -954,7 +963,7 @@ def _decode_search_request_data(request: Any) -> list[dict[str, Any]] | None:
             return None
         try:
             value = json.loads(encoded)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError, ValueError):
             return None
         if not isinstance(value, dict):
             return None
@@ -982,7 +991,7 @@ def _collect_named_values(
     elif isinstance(value, str) and value.lstrip().startswith(("{", "[")):
         try:
             nested = json.loads(value)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError, ValueError):
             return found
         found.extend(_collect_named_values(nested, names, depth=depth + 1))
     return found
@@ -1095,7 +1104,12 @@ class SearchResponseCollector:
             await route.fulfill(response=response, body=body)
             try:
                 payload = json.loads(body)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                RecursionError,
+                ValueError,
+            ) as exc:
                 await self._queue.put(
                     (
                         generation,
@@ -1268,13 +1282,25 @@ def _load_state_file(
         return None, {}, {}
 
     path = Path(state_file).expanduser()
-    if not path.is_file():
-        raise StateFileError(f"browser state not found: {path}")
+    try:
+        with path.open("rb") as stream:
+            payload = stream.read(MAX_STATE_BYTES + 1)
+    except FileNotFoundError as exc:
+        raise StateFileError("browser state not found") from exc
+    except OSError as exc:
+        raise StateFileError("browser state is unreadable") from exc
+    if len(payload) > MAX_STATE_BYTES:
+        raise StateFileError("browser state exceeds the 64 MiB safety limit")
 
     try:
-        snapshot = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise StateFileError(f"invalid browser state {path}: {exc}") from exc
+        snapshot = json.loads(payload.decode("utf-8"))
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
+        raise StateFileError("browser state is unreadable or invalid JSON") from exc
 
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("cookies"), list):
         raise StateFileError(
@@ -1525,10 +1551,18 @@ class XianyuSpider:
         keyword = keyword.strip()
         if not keyword:
             raise ValueError("keyword must not be empty")
-        if pages < 1:
-            raise ValueError("pages must be at least 1")
-        if max_retries < 1:
-            raise ValueError("max_retries must be at least 1")
+        if isinstance(pages, bool) or not isinstance(pages, int):
+            raise ValueError(  # noqa: TRY004 - public input uses ValueError.
+                "pages must be an integer"
+            )
+        if not 1 <= pages <= MAX_SEARCH_PAGES:
+            raise ValueError(f"pages must be between 1 and {MAX_SEARCH_PAGES}")
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+            raise ValueError(  # noqa: TRY004 - public input uses ValueError.
+                "max_retries must be an integer"
+            )
+        if not 1 <= max_retries <= MAX_SEARCH_RETRIES:
+            raise ValueError(f"max_retries must be between 1 and {MAX_SEARCH_RETRIES}")
         for label, value in (("min_price", min_price), ("max_price", max_price)):
             if value is None:
                 continue
@@ -1921,15 +1955,10 @@ class XianyuSpider:
 
             price_text = self._price_text(ex_content.get("price"))
 
-            raw_link = str(
-                main.get("targetUrl")
-                or main.get("itemUrl")
-                or ex_content.get("targetUrl")
-                or ""
-            )
-            url = raw_link.replace("fleamarket://", f"{BASE_URL}/", 1)
-            if not url:
-                url = f"{BASE_URL}/item?id={item_id}"
+            # Listing payloads are untrusted output. Always construct the item
+            # link from the observed ID instead of forwarding a remote deep link
+            # or arbitrary scheme to downstream Agent and notification clients.
+            url = f"{BASE_URL}/item?{urlencode({'id': item_id})}"
 
             published = self._format_timestamp(
                 click_args.get("publishTime") or ex_content.get("publishTime")

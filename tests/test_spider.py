@@ -292,6 +292,19 @@ def test_parse_item_and_fallback_url() -> None:
     assert item["publish_time"]
 
 
+@pytest.mark.parametrize(
+    "target_url",
+    ["javascript:alert(1)", "https://evil.example/phish", "//evil.example/phish"],
+)
+def test_parse_item_never_forwards_untrusted_target_url(target_url: str) -> None:
+    item = XianyuSpider()._parse_api_item(
+        make_wrapper(item_id="id with spaces", target_url=target_url)
+    )
+
+    assert item is not None
+    assert item["url"] == "https://www.goofish.com/item?id=id+with+spaces"
+
+
 def test_parse_flat_item_shape() -> None:
     item = XianyuSpider()._parse_api_item(
         {
@@ -350,6 +363,31 @@ def test_search_accepts_arbitrary_precision_integer_price(monkeypatch: Any) -> N
     monkeypatch.setattr(instance, "_search_once", empty_search)
 
     assert asyncio.run(instance.search("test", max_price=10**1000)) == []
+
+
+@pytest.mark.parametrize("field,value", [("pages", 21), ("max_retries", 11)])
+def test_search_resource_limits_are_enforced(field: str, value: int) -> None:
+    with pytest.raises(ValueError, match="must be between"):
+        asyncio.run(XianyuSpider().search("test", **{field: value}))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pages", True),
+        ("pages", 1.5),
+        ("pages", "1"),
+        ("max_retries", False),
+        ("max_retries", 1.5),
+        ("max_retries", "1"),
+    ],
+)
+def test_search_resource_limits_require_integers(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match=rf"{field} must be an integer"):
+        asyncio.run(XianyuSpider().search("test", **{field: value}))
 
 
 def test_parse_capture_accepts_success_and_rejects_risk_control() -> None:
@@ -976,6 +1014,49 @@ def test_load_state_rejects_invalid_schema(tmp_path: Path) -> None:
         _load_state_file(str(state_path))
 
 
+def test_load_state_errors_do_not_echo_private_path(tmp_path: Path) -> None:
+    missing = tmp_path / "private-secret-name.json"
+    with pytest.raises(
+        StateFileError, match="browser state not found"
+    ) as missing_error:
+        _load_state_file(str(missing))
+
+    assert str(missing) not in str(missing_error.value)
+
+    malformed = tmp_path / "another-private-secret-name.json"
+    malformed.write_text("not-json", encoding="utf-8")
+    with pytest.raises(
+        StateFileError, match="unreadable or invalid JSON"
+    ) as json_error:
+        _load_state_file(str(malformed))
+
+    assert str(malformed) not in str(json_error.value)
+
+
+def test_load_state_rejects_deeply_nested_json_as_state_error(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "deep-private-state.json"
+    state_path.write_text("[" * 100_000 + "0" + "]" * 100_000, encoding="utf-8")
+
+    with pytest.raises(StateFileError, match="unreadable or invalid JSON"):
+        _load_state_file(str(state_path))
+
+
+def test_load_state_enforces_bounded_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "oversized-private-state.json"
+    state_path.write_bytes(b"{}" * 9)
+    monkeypatch.setattr(spider, "MAX_STATE_BYTES", 16)
+
+    with pytest.raises(StateFileError, match="safety limit") as captured:
+        _load_state_file(str(state_path))
+
+    assert str(state_path) not in str(captured.value)
+
+
 def test_empty_state_is_not_treated_as_a_login_state(tmp_path: Path) -> None:
     state_path = tmp_path / "empty.json"
     state_path.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
@@ -1059,6 +1140,25 @@ def test_state_filter_rejects_malformed_cookie_domain(domain: str) -> None:
                         "value": "candidate",
                         "domain": domain,
                         "path": "/",
+                    }
+                ],
+                "origins": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("same_site", [[], {}])
+def test_state_filter_rejects_non_string_cookie_same_site(same_site: object) -> None:
+    with pytest.raises(StorageStateValidationError, match="cookie is invalid"):
+        _filter_goofish_storage_state(
+            {
+                "cookies": [
+                    {
+                        "name": "session",
+                        "value": "candidate",
+                        "domain": ".goofish.com",
+                        "path": "/",
+                        "sameSite": same_site,
                     }
                 ],
                 "origins": [],

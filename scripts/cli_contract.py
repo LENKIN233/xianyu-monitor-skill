@@ -14,6 +14,9 @@ from typing import Any, ParamSpec, TypeVar
 P = ParamSpec("P")
 R = TypeVar("R")
 
+MAX_SEARCH_PAGES = 20
+MAX_SEARCH_RETRIES = 10
+
 RAW_CDP_DISABLED_MESSAGE = (
     "raw TCP CDP is disabled because Chrome does not authenticate local clients; "
     "run the complete command on the browser-owning host with --browser-channel"

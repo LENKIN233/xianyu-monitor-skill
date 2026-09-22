@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: ["main"]
+    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -13,11 +14,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -25,3 +26,74 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest
+      - run: python scripts/release_bundle.py self-check
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python scripts/release_bundle.py build --release --output-dir dist
+      - run: python scripts/release_bundle.py verify --bundle dist/xianyu-monitor-${GITHUB_REF_NAME#v}.tar.gz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: xianyu-monitor-${{ github.ref_name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+      - name: Prepare version-specific release notes
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = Path("VERSION").read_text(encoding="ascii").strip()
+          if os.environ["GITHUB_REF_NAME"] != f"v{version}":
+              raise SystemExit("tag does not match VERSION")
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          section = re.search(
+              rf"^## {re.escape(version)} - [^\n]+\n(.*?)(?=^## |\Z)",
+              changelog,
+              re.MULTILINE | re.DOTALL,
+          )
+          if section is None or not section.group(1).strip():
+              raise SystemExit("version has no release notes")
+          notes = Path(os.environ["RUNNER_TEMP"]) / "xianyu-release-notes.md"
+          notes.write_text(section.group(1).strip() + "\n", encoding="utf-8")
+          PY
+      - name: Publish verified GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          flags=()
+          case "${RELEASE_TAG%%+*}" in
+            *-*) flags+=(--prerelease --latest=false) ;;
+          esac
+          gh release create "$RELEASE_TAG" \
+            "dist/xianyu-monitor-${RELEASE_TAG#v}.tar.gz" \
+            "dist/xianyu-monitor-${RELEASE_TAG#v}.tar.gz.sha256" \
+            --verify-tag --draft --title "$RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/xianyu-release-notes.md" "${flags[@]}"
+          release_assets="$RUNNER_TEMP/xianyu-release-assets"
+          gh release download "$RELEASE_TAG" --dir "$release_assets" \
+            --pattern '*.tar.gz' --pattern '*.sha256'
+          python scripts/release_bundle.py verify \
+            --bundle "$release_assets/xianyu-monitor-${RELEASE_TAG#v}.tar.gz"
+          cmp "dist/xianyu-monitor-${RELEASE_TAG#v}.tar.gz" \
+            "$release_assets/xianyu-monitor-${RELEASE_TAG#v}.tar.gz"
+          cmp "dist/xianyu-monitor-${RELEASE_TAG#v}.tar.gz.sha256" \
+            "$release_assets/xianyu-monitor-${RELEASE_TAG#v}.tar.gz.sha256"
+          gh release edit "$RELEASE_TAG" --verify-tag --draft=false "${flags[@]}"

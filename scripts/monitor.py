@@ -12,6 +12,8 @@ from typing import Any
 
 if __package__:
     from .cli_contract import (
+        MAX_SEARCH_PAGES,
+        MAX_SEARCH_RETRIES,
         RAW_CDP_DISABLED_MESSAGE,
         JsonArgumentParser,
         reject_raw_cdp_path,
@@ -19,6 +21,8 @@ if __package__:
     )
 else:
     from cli_contract import (
+        MAX_SEARCH_PAGES,
+        MAX_SEARCH_RETRIES,
         RAW_CDP_DISABLED_MESSAGE,
         JsonArgumentParser,
         reject_raw_cdp_path,
@@ -37,11 +41,14 @@ if __package__:
     )
     from .task_manager import (
         RecordRunProgress,
+        TaskFileChangedError,
+        TaskFileNotFoundError,
         TaskManager,
         TaskMutationInterrupted,
         TaskMutationPersistenceError,
         TaskMutationProgress,
         _raise_if_async_task_cancelling,
+        outbox_generation_key,
     )
 else:
     from spider import (
@@ -55,11 +62,14 @@ else:
     )
     from task_manager import (
         RecordRunProgress,
+        TaskFileChangedError,
+        TaskFileNotFoundError,
         TaskManager,
         TaskMutationInterrupted,
         TaskMutationPersistenceError,
         TaskMutationProgress,
         _raise_if_async_task_cancelling,
+        outbox_generation_key,
     )
 
 
@@ -140,7 +150,7 @@ def _committed_run_report(
     persistence: dict[str, Any] = {"status": persistence_status}
     if persistence_status == "not-established":
         persistence["possible_duplicate"] = True
-    return {
+    report = {
         "ok": persistence_status == "recorded",
         "task_id": task["id"],
         "keyword": task["keyword"],
@@ -156,6 +166,23 @@ def _committed_run_report(
         "identity": {"status": "not-evaluated"},
         "cleanup": cleanup_evidence(),
     }
+    report["outbox"] = {
+        "status": (
+            "recorded-with-task"
+            if persistence_status == "recorded"
+            else "not-established"
+        ),
+        "event_count": len(delivered_items),
+        "idempotency_keys": [
+            outbox_generation_key(
+                task["id"],
+                str(item["id"]),
+                int(task.get("delivery_generation", 0)),
+            )
+            for item in delivered_items
+        ],
+    }
+    return report
 
 
 def _effective_capability_status(
@@ -190,14 +217,24 @@ class MonitorRunProgress:
         if self.current_report is None:
             return reports
         current = dict(self.current_report)
-        current["ok"] = False
         cause = _interruption_cause(error)
+        persistence = current.get("persistence")
+        persistence_status = (
+            persistence.get("status") if isinstance(persistence, dict) else None
+        )
+        committed_success = (
+            current.get("ok") is True and persistence_status == "recorded"
+        )
+        if not committed_success:
+            current["ok"] = False
         if current.get("error_type") == "Interrupted":
             current["error"] = "task cancelled"
             current["error_type"] = type(cause).__name__
         else:
             current["interruption"] = {
-                "status": "cancelled",
+                "status": (
+                    "cancelled-after-task-commit" if committed_success else "cancelled"
+                ),
                 "error_type": type(cause).__name__,
             }
         error_status = search_capability_status(error)
@@ -248,6 +285,15 @@ class MonitorCancelledError(RuntimeError):
             self.cleanup_failures = list(failures)
 
 
+class MonitorPreflightError(ValueError):
+    """A recoverable monitor setup failure with machine-readable guidance."""
+
+    def __init__(self, message: str, *, code: str, hint: str):
+        super().__init__(message)
+        self.error_code = code
+        self.next_action = {"code": code, "hint": hint}
+
+
 async def run_tasks(
     args: argparse.Namespace,
     *,
@@ -256,31 +302,61 @@ async def run_tasks(
     run_progress = progress if progress is not None else MonitorRunProgress()
     if getattr(args, "cdp_user_data_dir", None):
         raise ValueError(RAW_CDP_DISABLED_MESSAGE)
-    tasks_path = Path(args.tasks_file).expanduser()
-    if not tasks_path.is_file():
-        raise ValueError(f"task file does not exist: {tasks_path.resolve()}")
     proxy = resolve_proxy(args.proxy, getattr(args, "proxy_file", None))
-    manager = TaskManager(args.tasks_file)
-    if args.task_id:
-        task = manager.get_task(args.task_id)
-        if task is None:
-            raise ValueError(f"task not found: {args.task_id}")
-        if task.get("status") != "running":
-            raise ValueError(f"task is not running: {args.task_id}")
-        tasks = [task]
-    else:
-        tasks = manager.list_tasks(running_only=True)
+    try:
+        manager = TaskManager(args.tasks_file, allow_missing=False)
+        if args.task_id:
+            task = manager.get_task(args.task_id)
+            if task is None:
+                raise MonitorPreflightError(
+                    "selected task was not found",
+                    code="list-tasks",
+                    hint=(
+                        "List tasks from the same task file and select an existing ID."
+                    ),
+                )
+            if task.get("status") != "running":
+                raise MonitorPreflightError(
+                    "task is not running",
+                    code="resume-task",
+                    hint="Resume the selected task before running monitor.",
+                )
+            tasks = [task]
+        else:
+            tasks = manager.list_tasks(running_only=True)
+    except TaskFileNotFoundError as exc:
+        raise MonitorPreflightError(
+            "task file does not exist",
+            code="create-task-file",
+            hint="Create a task at the intended path, then rerun monitor.",
+        ) from exc
 
     prepared_tasks: list[tuple[dict[str, Any], str | None]] = []
     for task in tasks:
         task_id = task["id"]
+        pages = task.get("pages", 1)
+        retries = task.get("retries", 3)
+        if pages > MAX_SEARCH_PAGES or retries > MAX_SEARCH_RETRIES:
+            raise MonitorPreflightError(
+                f"task {task_id} exceeds current safety limits "
+                f"(pages <= {MAX_SEARCH_PAGES}, retries <= {MAX_SEARCH_RETRIES}); "
+                "delete and recreate the task with bounded values",
+                code="recreate-bounded-task",
+                hint="Delete and recreate the task within current safety limits.",
+            )
         state_file = args.state or task.get("state_file")
         if state_file and not Path(str(state_file)).expanduser().is_absolute():
             if args.state:
-                raise ValueError("--state must be an absolute path")
-            raise ValueError(
+                raise MonitorPreflightError(
+                    "--state must be an absolute path",
+                    code="use-absolute-state-path",
+                    hint="Pass the authorized state file as an absolute path.",
+                )
+            raise MonitorPreflightError(
                 f"task {task_id} uses a legacy relative login-state path; "
-                "pass --state with an absolute path or recreate the task"
+                "pass --state with an absolute path or recreate the task",
+                code="use-absolute-state-path",
+                hint=("Pass an authorized absolute --state path or recreate the task."),
             )
         prepared_tasks.append((task, state_file))
 
@@ -341,14 +417,24 @@ async def run_tasks(
                 }
             )
             _raise_if_task_cancelling()
-            new_items = manager.record_run(
-                task_id,
-                items,
-                progress=record_progress,
+            record_method = (
+                manager.record_baseline if args.baseline else manager.record_run
             )
+            new_items = record_method(task_id, items, progress=record_progress)
             run_progress.current_report["persistence"] = {"status": "recorded"}
             _raise_if_task_cancelling()
-            report = _committed_run_report(args, task, spider, items, new_items)
+            report = _committed_run_report(
+                args,
+                task,
+                spider,
+                items,
+                new_items,
+            )
+            # Publish the full retained-item evidence while still inside the
+            # interruption handler. A signal after the task commit must never
+            # fall back to the pre-commit skeleton and lose notification data.
+            run_progress.current_report = report
+            _raise_if_task_cancelling()
         except TaskMutationInterrupted as exc:
             cause = _interruption_cause(exc)
             setattr(cause, "capability_status", "passed-for-this-run")
@@ -538,6 +624,20 @@ async def run_tasks(
                 report["pages_scraped"] = spider.pages_scraped
                 report["matched_count"] = len(items)
             run_progress.current_report = report
+            if isinstance(exc, TaskFileChangedError):
+                report.update(
+                    error_code="task-store-changed",
+                    next_action={
+                        "code": "inspect-task-store",
+                        "hint": (
+                            "Stop concurrent task-file writers, inspect the current "
+                            "store, and rerun without overwriting it."
+                        ),
+                    },
+                )
+                reports.append(report)
+                run_progress.current_report = None
+                break
             if run_progress.current_cleanup_failures:
                 report["error_recording"] = {"status": "not-attempted"}
                 reports.append(report)
@@ -736,12 +836,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 130
     except (OSError, SpiderError, TimeoutError, ValueError) as exc:
+        recovery: dict[str, Any] = {}
+        error_code = getattr(exc, "error_code", None)
+        next_action = getattr(exc, "next_action", None)
+        if isinstance(error_code, str):
+            recovery["error_code"] = error_code
+        if isinstance(next_action, dict):
+            recovery["next_action"] = next_action
         print(
             json.dumps(
                 {
                     "ok": False,
                     "error": str(exc),
-                    "error_type": type(exc).__name__,
+                    "error_type": (
+                        "ValueError"
+                        if isinstance(exc, MonitorPreflightError)
+                        else type(exc).__name__
+                    ),
                     "task_count": 0,
                     "new_count": 0,
                     "tasks": [],
@@ -749,6 +860,7 @@ def main(argv: list[str] | None = None) -> int:
                     "authentication": {"status": "not-evaluated"},
                     "identity": {"status": "not-evaluated"},
                     "cleanup": cleanup_evidence(exc),
+                    **recovery,
                 },
                 ensure_ascii=True,
                 allow_nan=False,
