@@ -182,3 +182,4 @@ def test_release_self_check_installs_into_empty_home() -> None:
     assert report["verified"] is True
     assert report["install_from_empty"] is True
     assert report["offline_demo"] is True
+    assert report["result_view"] is True

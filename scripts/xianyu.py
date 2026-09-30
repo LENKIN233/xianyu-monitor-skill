@@ -18,18 +18,19 @@ else:
     from cli_contract import sigterm_cancellable
 
 COMMANDS = {
-    "version": ("version_info", "show version and machine-readable capabilities"),
+    "version": ("version_info", "show the installed version and available commands"),
+    "view": ("view_results", "read, sort, and filter a saved listing report"),
     "demo": ("demo", "show the full workflow with synthetic offline data"),
-    "setup": ("setup", "guide first-run checks and capability validation"),
+    "setup": ("setup", "check setup, log in, and try a first search"),
     "doctor": ("doctor", "check Python, dependencies, browser, and private dirs"),
-    "state": ("state_check", "validate a private state candidate without a browser"),
-    "login": ("login_state", "open a dedicated browser and save candidate state"),
+    "state": ("state_check", "check a saved login file without opening a browser"),
+    "login": ("login_state", "log in using a separate browser window"),
     "search": ("spider", "run one Xianyu search and emit JSON"),
-    "analyze": ("analyze", "rank sanitized listing JSON with optional AI"),
-    "evaluate": ("evaluate", "regress AI output or capture local feedback"),
+    "analyze": ("analyze", "compare listings against your requirements with AI"),
+    "evaluate": ("evaluate", "check analysis against examples or save feedback"),
     "task": ("task_manager", "manage tasks, portable transfers, and outbox events"),
     "monitor": ("monitor", "run persistent monitor tasks and emit new listings"),
-    "deliver": ("deliver", "preview or deliver durable outbox events"),
+    "deliver": ("deliver", "preview or send pending notifications"),
     "install": ("install_skill", "install this skill for supported agent hosts"),
 }
 

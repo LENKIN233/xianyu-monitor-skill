@@ -413,7 +413,10 @@ def build_request_payload(
         "accusations. Score means observed criteria match from 0 to 100; lower it "
         "when evidence is missing. Reply in the predominant language of criteria "
         "and listings. Return exactly one result for every source_index and "
-        "preserve its id."
+        "preserve its id. Write brief, everyday language: state the specific "
+        "match or mismatch rather than repeating assessment boilerplate. Keep "
+        "the summary to one or two useful sentences. Uncertainties should name "
+        "the missing information relevant to the buyer, not generic warnings."
     )
     user_payload = {
         "task": "rank_xianyu_listings",

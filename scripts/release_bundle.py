@@ -752,6 +752,29 @@ def self_check(source: Path) -> dict[str, Any]:
             [sys.executable, str(installed / "scripts/xianyu.py"), "demo"],
             cwd=temp,
         )
+        demo_input = temp / "synthetic-demo.json"
+        demo_input.write_bytes(json.dumps(extracted_demo, ensure_ascii=True).encode())
+        views = [
+            _run_json(
+                [
+                    sys.executable,
+                    str(root / "scripts/xianyu.py"),
+                    "view",
+                    "--input",
+                    str(demo_input),
+                    "--format",
+                    "json",
+                    "--sort",
+                    "price-asc",
+                    "--limit",
+                    "2",
+                ],
+                cwd=temp,
+            )
+            for root in (extracted, installed)
+        ]
+        if views[0] != views[1] or views[0].get("shown_count") != 2:
+            raise ReleaseBundleError("installed result view differs from the bundle")
         health = _run_json(
             [
                 sys.executable,
@@ -785,6 +808,7 @@ def self_check(source: Path) -> dict[str, Any]:
             "verified": True,
             "install_from_empty": health["ok"] is True,
             "offline_demo": True,
+            "result_view": True,
         }
 
 

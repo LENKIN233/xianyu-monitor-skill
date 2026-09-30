@@ -50,6 +50,7 @@ if __package__:
         reject_raw_cdp_path,
         sigterm_cancellable,
     )
+    from .listing_filters import exclude_titles, normalize_exclusions
 else:
     from cli_contract import (
         MAX_SEARCH_PAGES,
@@ -59,6 +60,7 @@ else:
         reject_raw_cdp_path,
         sigterm_cancellable,
     )
+    from listing_filters import exclude_titles, normalize_exclusions
 
 
 BASE_URL = "https://www.goofish.com"
@@ -1545,10 +1547,14 @@ class XianyuSpider:
         location: str | None = None,
         pages: int = 1,
         max_retries: int = 3,
+        exclude_keywords: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Search, paginate, normalize, deduplicate, and locally filter items."""
 
         keyword = keyword.strip()
+        exclusions = normalize_exclusions(
+            [] if exclude_keywords is None else exclude_keywords
+        )
         if not keyword:
             raise ValueError("keyword must not be empty")
         if isinstance(pages, bool) or not isinstance(pages, int):
@@ -1586,11 +1592,14 @@ class XianyuSpider:
                 items = await self._search_once(keyword, pages)
                 self.last_capability_status = "passed-for-this-run"
                 try:
-                    return self._filter_items(
-                        items,
-                        min_price=min_price,
-                        max_price=max_price,
-                        location=location,
+                    return exclude_titles(
+                        self._filter_items(
+                            items,
+                            min_price=min_price,
+                            max_price=max_price,
+                            location=location,
+                        ),
+                        exclusions,
                     )
                 except (KeyboardInterrupt, asyncio.CancelledError) as exc:
                     setattr(exc, "search_passed", True)
@@ -2062,6 +2071,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-price", type=float, help="maximum price")
     parser.add_argument("--min-price", type=float, help="minimum price")
     parser.add_argument("--location", help="location substring")
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="WORD",
+        help="skip titles containing this word; repeat for more words",
+    )
     parser.add_argument("--pages", "-p", type=int, default=1, help="pages to fetch")
     parser.add_argument("--state", "-s", help="Playwright browser-state JSON")
     proxy_group = parser.add_mutually_exclusive_group()
@@ -2117,6 +2133,7 @@ def main(argv: list[str] | None = None) -> int:
                 location=args.location,
                 pages=args.pages,
                 max_retries=args.retries,
+                exclude_keywords=args.exclude,
             )
         )
         payload: dict[str, Any] = {
@@ -2135,6 +2152,7 @@ def main(argv: list[str] | None = None) -> int:
                 "min_price": args.min_price,
                 "max_price": args.max_price,
                 "location": args.location,
+                "exclude_keywords": normalize_exclusions(args.exclude),
             }
         print(json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False))
         return 0  # noqa: TRY300 - success emission must stay cancellation-protected.

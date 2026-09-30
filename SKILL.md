@@ -71,6 +71,27 @@ identity. A failure is not an empty result. Add bounded prices, location, and
 pages as requested. If headless capture fails without a rejection, try headed
 once; do not retry CAPTCHA/risk-control failures.
 
+Use repeated `--exclude WORD` flags for literal title exclusions, such as
+"保护壳" or "求购". Matching ignores letter case and full-width differences.
+Explain broad matches when relevant: excluding "配件" also removes "送配件".
+Do not silently add exclusions the user did not request.
+
+### Reading results
+
+Use `view --input FILE --sort price-asc --limit 10` to read saved search,
+monitor, or analysis JSON without another search. `--format markdown` produces
+a shareable list; `--exclude` here changes only that displayed list. A failed
+source still returns a failure exit code, even when it contains some items.
+For an introduction without credentials, use `demo --format text`.
+
+When replying, start with the useful result: a short list of titles, prices,
+locations, and links, followed by a concrete next step if needed. Write in the
+user's language. Keep hashes, schema versions, authentication dimensions, and
+internal gate names out of ordinary replies unless they explain an actual
+problem or the user asks for them. If a search failed, say so plainly; do not
+replace it with an empty-result claim. Mention missing listing information only
+when it matters to the user's choice, without repeating generic warnings.
+
 ### Monitoring
 
 After successful search, create or reuse the matching `task`. Establish a silent
@@ -81,6 +102,11 @@ new items. Use `reset-seen` only for intentional replay.
 Use preview/digest-bound apply for task updates and imports. Imported tasks remain
 stopped without a state path until deliberately configured. Treat missing task
 files and failed persistence as errors. See `task_manager.py` and `monitor.py`.
+Task creation also accepts `--exclude`; updates replace the full exclusion list
+or clear it with `--clear-excludes`. Excluded titles are filtered before seen IDs
+and new outbox events are recorded. Updating a filter does not reset seen IDs or
+remove previously queued notifications. Schema 1–3 stores upgrade on write to
+schema 4; preserve a full backup before using older runtimes again.
 
 Schedule at intervals of at least 30 minutes using the authorized task and state
 paths. Preserve JSON and exit status; use the host's no-notification behavior

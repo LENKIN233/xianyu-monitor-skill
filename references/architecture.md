@@ -225,7 +225,13 @@ Each monitor run loads all active tasks or one selected task. For every task it:
 
 The optional `criteria` string is an opaque hint copied into monitor output for
 downstream agent analysis. It is not executable filter syntax. The collector
-enforces only the keyword, numeric price bounds, and location fields.
+enforces the keyword, numeric price bounds, location, and literal title exclusions.
+`listing_filters.py` normalizes exclusion terms once with NFKC/case folding. Search
+and monitor share the matching logic; monitor filters before committing seen IDs
+and new outbox events. Changing terms preserves existing history and pending events.
+Task schema 4 stores these terms, while older stores load with an empty list and
+upgrade only on successful writes. Portable schema-1 definitions still import;
+new exports use schema 2 and include exclusions.
 Each task may also persist its browser executable channel. A monitor CLI
 override applies to every selected task; otherwise each task value precedes the
 environment default, so mixed active tasks can use different browsers.

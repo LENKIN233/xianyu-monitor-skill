@@ -19,6 +19,7 @@ if __package__:
         reject_raw_cdp_path,
         sigterm_cancellable,
     )
+    from .listing_filters import exclude_titles
 else:
     from cli_contract import (
         MAX_SEARCH_PAGES,
@@ -28,6 +29,7 @@ else:
         reject_raw_cdp_path,
         sigterm_cancellable,
     )
+    from listing_filters import exclude_titles
 
 if __package__:
     from .spider import (
@@ -407,6 +409,7 @@ async def run_tasks(
                 max_retries=int(task.get("retries", 3)),
             )
             search_passed = True
+            items = exclude_titles(items, task.get("exclude_keywords", []))
             run_progress.current_capability_status = "passed-for-this-run"
             run_progress.current_report.update(
                 {

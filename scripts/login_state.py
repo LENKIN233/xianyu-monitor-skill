@@ -425,7 +425,7 @@ def _browser_confirmation_document(token: str, binding_name: str) -> str:
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; style-src 'unsafe-inline';
                  script-src 'unsafe-inline'; form-action 'none'; connect-src 'none'">
-  <title>闲鱼登录状态确认</title>
+  <title>保存闲鱼登录文件</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif;
            margin: 0; background: #f6f7f9; color: #1f2328; }}
@@ -451,20 +451,19 @@ def _browser_confirmation_document(token: str, binding_name: str) -> str:
 </head>
 <body>
   <main>
-    <h1>确认保存闲鱼候选登录状态</h1>
-    <p class="note">先切换到闲鱼标签页。扫码后还要在手机闲鱼中确认登录；
-      二维码消失不代表登录已经完成。等待网页显示你的头像或昵称，再打开账号区域
-      核对预期账号。全部完成以后，最后回到本页输入下方确认码。验证和保存结束后，
-      本工具启动的专用浏览器会自动关闭，这是正常的安全清理。</p>
+    <h1>保存闲鱼登录文件</h1>
+    <p class="note">请先在闲鱼标签页完成登录：扫码后，在手机上点确认，
+      再核对网页上的头像或昵称。完成后回到这里，输入下方确认码。
+      保存成功后，这个浏览器窗口会自动关闭，接下来就可以尝试搜索。</p>
     <p><code>{visible_token}</code></p>
     <form id="confirmation-form">
       <label for="confirmation-input">确认码</label>
       <input id="confirmation-input" autocomplete="off" spellcheck="false">
-      <button type="submit">确认保存候选状态</button>
+      <button type="submit">保存登录文件</button>
     </form>
     <p id="error" hidden>确认码不匹配，请重新核对。</p>
     <p id="status" data-stage="waiting" aria-live="polite">
-      尚未提交确认码；此页面会保留到保存结果明确以后。
+      完成登录后，请输入上方确认码。
     </p>
   </main>
   <script>
@@ -474,11 +473,11 @@ def _browser_confirmation_document(token: str, binding_name: str) -> str:
     const error = document.getElementById('error');
     const status = document.getElementById('status');
     const stageMessages = {{
-      waiting: '尚未提交确认码；此页面会保留到保存结果明确以后。',
-      saving: '已收到确认，正在本地验证并保存候选状态，请不要关闭浏览器。',
-      saved: '候选状态已安全保存。专用浏览器将在 5 秒后自动关闭。',
-      'saved-warning': '候选状态已保存，但命令未完整结束；请回到终端查看原因。',
-      failed: '候选状态未完成保存，请回到终端查看安全处理后的原因。',
+      waiting: '完成登录后，请输入上方确认码。',
+      saving: '正在检查并保存，请稍等，不要关闭窗口。',
+      saved: '登录文件已保存。这个浏览器窗口将在 5 秒后关闭。',
+      'saved-warning': '文件已保存，但程序尚未正常结束。请查看终端提示。',
+      failed: '保存结果未确认，请查看终端提示。',
     }};
     const stageRanks = {{
       waiting: 0, saving: 1, saved: 2, 'saved-warning': 2, failed: 2,

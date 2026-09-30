@@ -23,6 +23,45 @@ class FakeSpider:
         return [{"id": "new-1", "title": "新商品", "price": 100}]
 
 
+def test_title_exclusions_precede_seen_ids_and_outbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tasks.json"
+    manager = TaskManager(path)
+    task = manager.create_task("相机", exclude_keywords=["保护壳"])
+
+    class ListingsSpider(FakeSpider):
+        async def search(self, **_kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {"id": "camera", "title": "相机"},
+                {"id": "case", "title": "相机保护壳"},
+            ]
+
+    monkeypatch.setattr(monitor, "XianyuSpider", ListingsSpider)
+    command = ["--tasks-file", str(path), "--task-id", task["id"]]
+    assert monitor.main(command) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["new_count"] == 1
+    manager = TaskManager(path)
+    assert manager.get_task(task["id"])["seen_item_ids"] == ["camera"]
+    assert [event["item_id"] for event in manager.list_outbox()] == ["camera"]
+
+    preview = manager.preview_update(task["id"], {"exclude_keywords": []})
+    manager.update_task(
+        task["id"],
+        {"exclude_keywords": []},
+        expected_preview_sha256=preview["approval"]["preview_sha256"],
+    )
+    assert monitor.main(command) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["new_count"] == 1
+    assert report["tasks"][0]["items"][0]["id"] == "case"
+    assert [event["item_id"] for event in TaskManager(path).list_outbox()] == [
+        "camera",
+        "case",
+    ]
+
+
 def test_monitor_persists_seen_items(tmp_path: Path, monkeypatch: Any) -> None:
     tasks_file = tmp_path / "tasks.json"
     manager = TaskManager(str(tasks_file))
