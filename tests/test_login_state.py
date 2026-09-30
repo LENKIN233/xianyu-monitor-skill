@@ -414,12 +414,12 @@ def test_browser_confirmation_explains_scan_is_not_login_completion() -> None:
         "__confirm",
     )
 
-    assert "扫码后还要在手机闲鱼中确认登录" in document
-    assert "二维码消失不代表登录已经完成" in document
-    assert "专用浏览器会自动关闭" in document
-    assert "候选状态已安全保存。专用浏览器将在 5 秒后自动关闭" in document
-    assert "候选状态已保存，但命令未完整结束" in document
-    assert "候选状态未完成保存" in document
+    assert "扫码后，在手机上点确认" in document
+    assert "核对网页上的头像或昵称" in document
+    assert "这个浏览器窗口会自动关闭" in document
+    assert "登录文件已保存。这个浏览器窗口将在 5 秒后关闭" in document
+    assert "文件已保存，但程序尚未正常结束" in document
+    assert "保存结果未确认" in document
     assert "stageRanks[stage] < stageRanks[status.dataset.stage]" in document
     assert "SAVE-1234" in document
 

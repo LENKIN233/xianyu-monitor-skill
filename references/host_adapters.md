@@ -71,6 +71,15 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe scripts\xianyu.py doctor
 ```
 
+Before `setup --capture-state`, create the personal directory used by the README:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME/.local/share/xianyu" | Out-Null
+```
+
+Keep this directory private to your Windows user. Run the README's multi-line
+Bash commands on one line in PowerShell, using `.\.venv\Scripts\python.exe`.
+
 If `doctor` returns `next_action.code: install-browser`, run:
 
 ```powershell
@@ -304,13 +313,13 @@ details and must remain outside the portable core workflow.
 Before upgrading from v1, pause the scheduler, wait for active monitor/delivery
 runs to finish, and preserve the entire private task store plus the old runtime.
 `task export` omits state references, seen IDs, and pending outbox events; it is
-not a recovery backup. Read schema-1/2 tasks with the new runtime before enabling
-mutations; the next successful write upgrades the store to schema 3 while keeping
+not a recovery backup. Read schema-1/2/3 tasks with the new runtime before enabling
+mutations; the next successful write upgrades the store to schema 4 while keeping
 definitions and seen IDs. Resume existing tasks without a new baseline.
 
 To roll back, pause scheduling again and preserve the current store separately.
 Reconcile any pending delivery events, then point the old runtime at the original
-backup, never at the schema-3 store. Old seen history may cause listings observed
+backup, never at the schema-4 store. Old seen history may cause listings observed
 during the upgrade to reappear. Keep all backups private and outside the checkout.
 
 A symlink install tracks the checkout; update it with `git pull`, then reinstall

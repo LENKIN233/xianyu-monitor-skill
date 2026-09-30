@@ -29,8 +29,9 @@ def test_version_payload_has_stable_capability_discovery() -> None:
     assert capability_ids == sorted(capability_ids)
     assert {"setup", "state", "search", "analyze"} <= set(capability_ids)
     assert all(item["status"] == "available" for item in payload["capabilities"])
-    assert payload["contracts"]["task_schema"] == 3
-    assert payload["contracts"]["task_transfer_schema"] == 1
+    assert payload["contracts"]["task_schema"] == 4
+    assert payload["contracts"]["task_transfer_schema"] == 2
+    assert payload["contracts"]["view_schema"] == 1
     assert payload["contracts"]["outbox_schema"] == 1
     assert payload["contracts"]["delivery_schema"] == 1
     assert payload["contracts"]["ai_run_evidence_schema"] == 1

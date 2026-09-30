@@ -33,6 +33,122 @@ def test_task_ids_are_unique_and_duplicates_are_stable(tmp_path: Path) -> None:
     assert len(manager.list_tasks()) == 2
 
 
+def test_exclusions_survive_create_update_and_portable_round_trip(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tasks.json"
+    manager = TaskManager(path)
+    task = manager.create_task("相机", exclude_keywords=["ＣＡＳＥ", "求购"])
+    duplicate = manager.create_task("相机", exclude_keywords=["求购", "case", "case"])
+    distinct = manager.create_task("相机", exclude_keywords=["租赁"])
+    assert duplicate["id"] == task["id"]
+    assert distinct["id"] != task["id"]
+    assert TaskManager(path).get_task(task["id"])["exclude_keywords"] == [
+        "case",
+        "求购",
+    ]
+
+    exported = manager.export_tasks()
+    assert exported["schema_version"] == 2
+    target = TaskManager(tmp_path / "imported.json")
+    preview = target.preview_import(exported)
+    target.import_tasks(
+        exported, expected_preview_sha256=preview["approval"]["preview_sha256"]
+    )
+    assert target.list_tasks()[0]["exclude_keywords"] == ["case", "求购"]
+    assert target.list_tasks()[0]["status"] == "stopped"
+
+    preview = manager.preview_update(task["id"], {"exclude_keywords": ["保护壳"]})
+    with pytest.raises(ValueError, match="preview"):
+        manager.update_task(
+            task["id"],
+            {"exclude_keywords": []},
+            expected_preview_sha256=preview["approval"]["preview_sha256"],
+        )
+    manager.update_task(
+        task["id"],
+        {"exclude_keywords": ["保护壳"]},
+        expected_preview_sha256=preview["approval"]["preview_sha256"],
+    )
+    assert TaskManager(path).get_task(task["id"])["exclude_keywords"] == ["保护壳"]
+
+
+def test_schema_three_upgrade_keeps_pending_notifications(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.json"
+    manager = TaskManager(path)
+    task = manager.create_task("相机")
+    manager.record_run(task["id"], [{"id": "pending", "title": "相机"}])
+    pending = manager.list_outbox()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 3
+    payload["tasks"][0].pop("exclude_keywords")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    original = path.read_bytes()
+
+    upgraded = TaskManager(path)
+    assert upgraded.list_outbox() == pending
+    assert path.read_bytes() == original
+    upgraded.set_status(task["id"], "stopped")
+    assert upgraded.list_outbox() == pending
+    assert upgraded.get_task(task["id"])["seen_item_ids"] == ["pending"]
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 4
+
+
+def test_cli_exclusions_can_be_cleared_with_preview_digest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tasks.json"
+    assert (
+        task_manager.main(
+            ["--data-file", str(path), "create", "相机", "--exclude", "保护壳"]
+        )
+        == 0
+    )
+    task_id = json.loads(capsys.readouterr().out)["result"]["id"]
+    command = ["--data-file", str(path), "update", task_id, "--clear-excludes"]
+    assert task_manager.main([*command, "--preview"]) == 0
+    preview = json.loads(capsys.readouterr().out)["result"]
+    assert (
+        task_manager.main(
+            [
+                *command,
+                "--apply",
+                "--expected-preview-sha256",
+                preview["approval"]["preview_sha256"],
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert TaskManager(path).get_task(task_id)["exclude_keywords"] == []
+
+
+@pytest.mark.parametrize("exclusions", [None, "配件", [1], [" "]])
+def test_invalid_persisted_exclusions_do_not_rewrite_store(
+    tmp_path: Path, exclusions: object
+) -> None:
+    path = tmp_path / "tasks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "tasks": [
+                    {
+                        "id": "task_one",
+                        "keyword": "相机",
+                        "exclude_keywords": exclusions,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    original = path.read_bytes()
+    with pytest.raises(ValueError):
+        TaskManager(path)
+    assert path.read_bytes() == original
+
+
 def test_record_run_returns_only_new_items(tmp_path: Path) -> None:
     manager = TaskManager(str(tmp_path / "tasks.json"))
     task = manager.create_task("相机")
@@ -164,7 +280,7 @@ def test_outbox_cli_lists_and_acknowledges_without_delivery(
     assert TaskManager(str(tasks_file)).list_outbox() == []
 
 
-@pytest.mark.parametrize("schema_version", [1, 2])
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
 def test_outbox_survives_legacy_task_store_upgrade(
     tmp_path: Path, schema_version: int
 ) -> None:
@@ -195,7 +311,8 @@ def test_outbox_survives_legacy_task_store_upgrade(
     )
 
     payload = json.loads(tasks_file.read_text())
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
+    assert payload["tasks"][0]["exclude_keywords"] == []
     assert new_items == [{"id": "item_1"}]
     assert payload["tasks"][0]["seen_item_ids"] == ["already_seen", "item_1"]
     assert payload["tasks"][0]["criteria"] == "4K"
@@ -212,7 +329,7 @@ def test_task_file_is_private_and_atomic_schema_is_present(tmp_path: Path) -> No
     if os.name != "nt":
         assert stat.S_IMODE(task_file.stat().st_mode) == 0o600
     payload = json.loads(task_file.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["outbox"] == []
 
 
@@ -588,6 +705,7 @@ def test_task_export_omits_credentials_and_runtime_history(tmp_path: Path) -> No
             "location": None,
             "criteria": "只看机身",
             "pages": 1,
+            "exclude_keywords": [],
             "retries": 3,
             "browser_channel": None,
         }
@@ -694,7 +812,7 @@ def test_invalid_task_file_is_not_silently_erased(tmp_path: Path) -> None:
         TaskManager(str(task_file))
 
 
-@pytest.mark.parametrize("schema_version", [None, 0, 4, "2", True])
+@pytest.mark.parametrize("schema_version", [None, 0, 5, "2", True])
 def test_invalid_schema_versions_are_rejected(
     tmp_path: Path,
     schema_version: object,
@@ -705,7 +823,7 @@ def test_invalid_schema_versions_are_rejected(
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="schema_version must be 1, 2, or 3"):
+    with pytest.raises(ValueError, match="schema_version must be 1, 2, 3, or 4"):
         TaskManager(str(task_file))
 
 

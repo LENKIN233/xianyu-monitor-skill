@@ -5,6 +5,7 @@
 - [xianyu.py](#xianyupy)
 - [version_info.py](#version_infopy)
 - [demo.py](#demopy)
+- [view_results.py](#view_resultspy)
 - [setup.py](#setuppy)
 - [doctor.py](#doctorpy)
 - [state_check.py](#state_checkpy)
@@ -38,6 +39,7 @@ Primary workflow dispatcher:
 
 ```text
 version   -> version_info.py
+view      -> view_results.py
 demo      -> demo.py
 setup     -> setup.py
 doctor    -> doctor.py
@@ -87,6 +89,34 @@ Output schema 1 marks `demo.status: synthetic`, every unused authority boundary,
 and `claims_real_xianyu_state: false`. It ends with `next_action.code: run-setup`.
 It is a walkthrough and release smoke contract, never evidence of real
 authentication, current listings, AI-provider quality, or delivery success.
+
+## `view_results.py`
+
+Read `search`, `monitor`, `analyze`, or `demo` result JSON without network access,
+task-file writes, or model calls:
+
+```text
+--input FILE              Result JSON; relative/absolute path or - for stdin (default)
+--sort original           Also price-asc or price-desc; unknown prices sort last
+--limit 20                Display 1–100 items, after sorting and filtering
+--exclude WORD            Repeat for literal title exclusions on this report only
+--format text             Also markdown or json
+```
+
+Input is bounded to 2 MiB and 5000 listings. Schema-1 JSON reports include received,
+excluded, matched, and shown counts. Human output shows title, price, location and
+a Goofish URL rebuilt from the listing ID. Analysis rows may include the score,
+matching reasons, and questions still to check. Private paths, seller fields,
+credentials, arbitrary input URLs, and unknown fields are not copied. Markdown
+escapes listing text; terminal control characters are removed.
+
+A failed source remains `ok: false` and exits 2 even when retained items are
+shown. Reading those items does not confirm persistence or delivery; inspect the
+original monitor report/outbox before sending. The command does not claim that
+the source JSON proves a current login or live search. Demo data stays labeled.
+
+`demo --format text|markdown` uses this renderer; plain `demo` retains its full
+JSON envelope. All human-readable output from these modes uses UTF-8.
 
 ## `setup.py`
 
@@ -161,6 +191,7 @@ Search Xianyu once and emit a JSON object.
 --min-price         Inclusive local minimum price
 --max-price         Inclusive local maximum price
 --location          Case-insensitive location substring
+--exclude WORD      Skip titles containing WORD; repeat, maximum 20 terms
 --pages, -p         Maximum pages to fetch; default 1, limit 20
 --state, -s         Playwright state or enhanced snapshot
 --proxy             HTTP(S) or SOCKS proxy; may be visible in argv
@@ -173,6 +204,11 @@ Search Xianyu once and emit a JSON object.
 ```
 
 Successful output:
+
+Title exclusions use literal substrings with Unicode NFKC and case folding,
+applied locally alongside price and location filters. `--debug` includes the
+normalized `exclude_keywords` list in `filters`. Filtering does not fetch more
+pages to replace excluded results.
 
 ```json
 {
@@ -363,6 +399,7 @@ Create options:
 --max-price
 --location
 --criteria
+--exclude WORD              Repeat; literal title exclusions stored with the task
 --pages
 --retries
 --state
@@ -380,18 +417,28 @@ recreate them using current bounds.
 definitions, including but never exposing a private state path. Apply identical
 arguments with `--apply --expected-preview-sha256 DIGEST`; an intervening edit
 makes the digest stale and fails before commit.
+`update --exclude` replaces the complete exclusion list, while `--clear-excludes`
+removes it. Both use the same preview/apply flow. Exclusions match titles only,
+using Unicode NFKC and case folding; at most 20 terms of 1–80 characters are
+accepted. There are no implicit category exclusions. Existing seen IDs and
+pending notifications are not reset or removed by a filter change.
 
-`export` emits schema-1 portable definitions only: keyword, filters, criteria,
+`export` emits schema-2 portable definitions only: keyword, filters, exclusions, criteria,
 pages, retries, and browser channel. It excludes state paths, status, seen IDs,
 history, timestamps, and outbox. `import` accepts only this strict schema from an
 absolute regular non-symlink path or stdin, previews deduplicated additions, and
-requires digest-bound apply. Imported tasks are stopped with no state path;
+requires digest-bound apply. Schema-1 exports remain importable with an empty
+exclusion list. Imported tasks are stopped with no state path;
 explicitly bind authorized state and resume after inspection.
 The importer accepts either the raw transfer object or the exact successful JSON
 envelope written by `task export`, so redirecting that command to a file is a
 lossless no-secret round trip.
 
-Task schema 3 stores pending outbox events in the same atomic commit as new seen
+Task schema 4 adds `exclude_keywords` to each definition. Schema 1–3 files remain
+readable and migrate on a successful write without losing seen IDs or outbox
+events; an older runtime rejects schema 4 rather than ignoring exclusions.
+Title exclusions are applied before recording seen IDs and new outbox events.
+Pending outbox events are stored in the same atomic commit as new seen
 IDs. Each event has a stable SHA-256 idempotency key for one task/item delivery
 generation and an allowlisted payload
 without state paths, seller, images, unknown fields, or credentials. Baselines
@@ -413,7 +460,7 @@ before publish, the mutation exits nonzero with `persistence.status: not-recorde
 instead of overwriting or recreating that store. Monitor additionally returns
 `error_code: task-store-changed` and does not attempt to record an error into the
 new file.
-Existing version-1 and version-2 task files are normalized when loaded.
+Existing version-1, version-2, and version-3 task files are normalized when loaded.
 The complete task file is schema-validated before use: field types, unique IDs,
 bounded result/seen lists, and finite prices are required. A malformed entry or
 non-standard JSON number fails the operation without rewriting or filtering the
@@ -872,7 +919,7 @@ network access. `verify --bundle FILE [--checksum FILE]` rejects checksum,
 manifest, payload, SBOM, archive-shape, and canonical-byte mismatches without
 extracting. `self-check` builds twice, verifies byte equality, performs an
 empty-HOME copy-install/version/health smoke, and requires identical passing
-synthetic demo JSON from the extracted and installed copies.
+synthetic demo JSON and sorted `view` output from the extracted and installed copies.
 
 Formal publishing must use `build --release`; it fails unless Git is available,
 the worktree is clean including untracked files, and HEAD has the exact
@@ -898,7 +945,8 @@ overwritten by a rerun; investigate an interrupted draft before resuming it.
 
 Diagnostic logs go to stderr. Machine-readable JSON goes to stdout unless
 `--quiet-if-empty` suppresses a successful zero-new monitor run.
-Stdout JSON escapes non-ASCII characters so redirected Windows and legacy
+Except for `view` and explicitly selected demo text/Markdown modes, stdout JSON
+escapes non-ASCII characters so redirected Windows and legacy
 scheduler encodings cannot lose a notification; JSON parsers recover the
 original Unicode text.
 

@@ -130,6 +130,7 @@ def test_unified_cli_delegates_command_help_from_foreign_working_directory(
 ) -> None:
     expected_options = {
         "version": "--short",
+        "view": "--sort",
         "demo": "deterministic offline",
         "setup": "--state",
         "doctor": "--state-output-dir",

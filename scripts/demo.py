@@ -8,13 +8,14 @@ import json
 from typing import Any
 
 if __package__:
-    from . import analyze, deliver, evaluate
+    from . import analyze, deliver, evaluate, view_results
     from .cli_contract import JsonArgumentParser, sigterm_cancellable
     from .task_manager import outbox_generation_key
 else:
     import analyze
     import deliver
     import evaluate
+    import view_results
     from cli_contract import JsonArgumentParser, sigterm_cancellable
     from task_manager import outbox_generation_key
 
@@ -27,7 +28,7 @@ def _synthetic_search() -> dict[str, Any]:
     return {
         "ok": True,
         "keyword": "MacBook Air M2",
-        "criteria": "优先 16GB、上海自提；缺少电池信息时保留不确定性",
+        "criteria": "想找 16GB、能在上海自提的机器，还想确认电池健康度",
         "count": 3,
         "pages_scraped": 1,
         "items": [
@@ -70,7 +71,10 @@ def _synthetic_search() -> dict[str, Any]:
 
 def _synthetic_model_output() -> dict[str, Any]:
     return {
-        "summary": "第一条最符合 16GB 与上海自提条件；其余证据不足或明显是配件。",
+        "summary": (
+            "第一台写明了 16GB，也能在上海自提，可以先看看。"
+            "第二台只有 8GB，第三件是保护壳。"
+        ),
         "items": [
             {
                 "source_index": 0,
@@ -78,7 +82,7 @@ def _synthetic_model_output() -> dict[str, Any]:
                 "score": 92,
                 "match_level": "high_match",
                 "observed_evidence": ["标题标明 16GB、512GB 和上海自提"],
-                "uncertainties": ["未观察到电池健康与维修历史"],
+                "uncertainties": ["卖家没写电池健康度，也没说是否修过"],
                 "risk_signals": [],
             },
             {
@@ -87,7 +91,7 @@ def _synthetic_model_output() -> dict[str, Any]:
                 "score": 38,
                 "match_level": "low_match",
                 "observed_evidence": ["标题标明 8GB，地点为杭州"],
-                "uncertainties": ["未观察到电池健康与维修历史"],
+                "uncertainties": ["卖家没写电池健康度，也没说是否修过"],
                 "risk_signals": [],
             },
             {
@@ -97,7 +101,7 @@ def _synthetic_model_output() -> dict[str, Any]:
                 "match_level": "low_match",
                 "observed_evidence": ["标题和标签表明这是保护壳配件"],
                 "uncertainties": [],
-                "risk_signals": ["价格与目标整机不在同一量级"],
+                "risk_signals": ["这是保护壳，不是电脑"],
             },
         ],
     }
@@ -208,24 +212,34 @@ def build_demo() -> dict[str, Any]:
         "delivery_preview": delivery_preview,
         "next_action": {
             "code": "run-setup",
-            "hint": (
-                "Run xianyu setup with an explicit private state path and keyword "
-                "to test one real authorized search."
-            ),
+            "hint": ("用 setup 指定登录文件和想搜的商品，完成第一次搜索。"),
         },
     }
 
 
 def build_parser() -> JsonArgumentParser:
-    return JsonArgumentParser(
+    parser = JsonArgumentParser(
         description="Show a deterministic offline xianyu-monitor product demo"
     )
+    parser.add_argument(
+        "--format",
+        choices=("json", "text", "markdown"),
+        default="json",
+        help="output format; text shows a readable listing report",
+    )
+    return parser
 
 
 @sigterm_cancellable
 def main(argv: list[str] | None = None) -> int:
-    build_parser().parse_args(argv)
-    print(json.dumps(build_demo(), ensure_ascii=True, indent=2, allow_nan=False))
+    args = build_parser().parse_args(argv)
+    payload = build_demo()
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False))
+    else:
+        view_results.print_report(
+            view_results.render_report(view_results.build_report(payload), args.format)
+        )
     return 0
 
 

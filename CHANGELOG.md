@@ -3,6 +3,28 @@
 All notable user-visible changes are recorded here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## 2.0.0-rc.2 - 2026-09-30
+
+这次主要改进使用说明和看结果的方式，并加入标题排除词。
+
+### 使用变化
+
+- 重写 README，按安装、搜索、监控和通知组织内容；详细字段和发布检查留在参考文档。
+- 登录确认页改用“保存登录文件”等直接的说法；更新 Skill 回复要求、AI 分析用语和示例。
+- 新增 `view`：读取已有结果，按价格排序、限制显示数量，输出文本、Markdown 或 JSON。
+  商品链接由编号生成，价格未知的商品放在最后；原始运行失败时仍显示失败并返回非零退出码。
+- `demo --format text` 可以直接查看模拟商品清单，默认 JSON 输出保持兼容。
+- 搜索和监控任务支持重复的 `--exclude WORD`，按标题文字排除结果。任务可通过
+  `update --exclude` 替换排除词，或 `--clear-excludes` 清空。
+
+### 升级注意
+
+- 任务文件升为 schema 4，旧 schema 1–3 的任务、去重历史和待发送通知保留。
+  旧程序不能读取新格式，升级前需备份完整任务文件。
+- 任务导出升为 schema 2，包含排除词；仍能导入 schema 1 的旧文件。
+- 新排除词只影响之后收集的商品，不清空历史，也不删除已有待发送通知。
+- 仍为候选版。真实闲鱼搜索和所选 AI、通知服务的联调未在本次更新中执行。
+
 ## 2.0.0-rc.1 - 2026-09-22
 
 This release candidate freezes the documented command/schema surface for final

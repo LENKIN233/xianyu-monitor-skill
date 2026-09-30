@@ -25,6 +25,7 @@ BUNDLE_FILES = (
     "scripts/doctor.py",
     "scripts/evaluate.py",
     "scripts/install_skill.py",
+    "scripts/listing_filters.py",
     "scripts/login_state.py",
     "scripts/monitor.py",
     "scripts/setup.py",
@@ -32,6 +33,7 @@ BUNDLE_FILES = (
     "scripts/state_check.py",
     "scripts/task_manager.py",
     "scripts/version_info.py",
+    "scripts/view_results.py",
     "scripts/xianyu.py",
 )
 

@@ -30,6 +30,7 @@ if __package__:
         JsonArgumentParser,
         sigterm_cancellable,
     )
+    from .listing_filters import normalize_exclusions
 else:
     from cli_contract import (
         MAX_SEARCH_PAGES,
@@ -37,9 +38,10 @@ else:
         JsonArgumentParser,
         sigterm_cancellable,
     )
+    from listing_filters import normalize_exclusions
 
-SCHEMA_VERSION = 3
-TASK_TRANSFER_SCHEMA = 1
+SCHEMA_VERSION = 4
+TASK_TRANSFER_SCHEMA = 2
 TASK_UPDATE_PREVIEW_VERSION = 1
 MAX_TASK_TRANSFER_BYTES = 2 * 1024 * 1024
 MAX_SEEN_ITEMS = 50_000
@@ -60,6 +62,7 @@ TASK_DEFINITION_FIELDS = (
     "min_price",
     "max_price",
     "location",
+    "exclude_keywords",
     "criteria",
     "pages",
     "retries",
@@ -786,6 +789,10 @@ class TaskManager:
         normalized.setdefault("min_price", None)
         normalized.setdefault("max_price", None)
         normalized.setdefault("location", None)
+        normalized.setdefault("exclude_keywords", [])
+        normalized["exclude_keywords"] = normalize_exclusions(
+            normalized["exclude_keywords"]
+        )
         normalized.setdefault("criteria", "")
         normalized.setdefault("pages", 1)
         normalized.setdefault("retries", 3)
@@ -964,10 +971,10 @@ class TaskManager:
         if (
             isinstance(schema_version, bool)
             or not isinstance(schema_version, int)
-            or schema_version not in {1, 2, SCHEMA_VERSION}
+            or schema_version not in {1, 2, 3, SCHEMA_VERSION}
         ):
             raise self._schema_error(
-                f"schema_version must be 1, 2, or {SCHEMA_VERSION}"
+                f"schema_version must be 1, 2, 3, or {SCHEMA_VERSION}"
             )
         if "updated_at" in payload:
             updated_at = payload["updated_at"]
@@ -1290,6 +1297,7 @@ class TaskManager:
         retries: int,
         state_file: str | None,
         browser_channel: str | None,
+        exclude_keywords: list[str],
     ) -> dict[str, Any] | None:
         for task in self.tasks:
             if (
@@ -1297,6 +1305,7 @@ class TaskManager:
                 and task.get("max_price") == max_price
                 and task.get("min_price") == min_price
                 and task.get("location") == location
+                and task.get("exclude_keywords", []) == exclude_keywords
                 and task.get("criteria", "") == criteria
                 and int(task.get("pages", 1)) == pages
                 and int(task.get("retries", 3)) == retries
@@ -1320,9 +1329,13 @@ class TaskManager:
         retries: int = 3,
         state_file: str | None = None,
         browser_channel: str | None = None,
+        exclude_keywords: list[str] | None = None,
         progress: TaskMutationProgress | None = None,
     ) -> dict[str, Any]:
         keyword = keyword.strip()
+        exclusions = normalize_exclusions(
+            [] if exclude_keywords is None else exclude_keywords
+        )
         if not keyword:
             raise ValueError("keyword must not be empty")
         self._validate_prices(min_price, max_price)
@@ -1364,6 +1377,7 @@ class TaskManager:
                     retries,
                     state_file,
                     browser_channel,
+                    exclusions,
                 )
                 if existing:
                     result = copy.deepcopy(existing)
@@ -1378,6 +1392,7 @@ class TaskManager:
                         "min_price": min_price,
                         "criteria": criteria,
                         "location": location,
+                        "exclude_keywords": exclusions,
                         "pages": pages,
                         "retries": retries,
                         "state_file": state_file,
@@ -1599,7 +1614,8 @@ class TaskManager:
         if set(transfer) != {"schema_version", "kind", "tasks"}:
             raise ValueError("task import document contains unexpected fields")
         if (
-            transfer.get("schema_version") != TASK_TRANSFER_SCHEMA
+            type(transfer.get("schema_version")) is not int
+            or transfer.get("schema_version") not in {1, TASK_TRANSFER_SCHEMA}
             or transfer.get("kind") != "xianyu-monitor-task-definitions"
             or not isinstance(transfer.get("tasks"), list)
         ):
@@ -1608,6 +1624,8 @@ class TaskManager:
         if len(raw_tasks) > 1_000:
             raise ValueError("task import document contains too many tasks")
         expected_fields = {"source_id", *PORTABLE_TASK_FIELDS}
+        if transfer["schema_version"] == 1:
+            expected_fields.remove("exclude_keywords")
         definitions: list[dict[str, Any]] = []
         source_ids: set[str] = set()
         for index, raw_task in enumerate(raw_tasks):
@@ -1628,6 +1646,7 @@ class TaskManager:
                 **{
                     field_name: copy.deepcopy(raw_task[field_name])
                     for field_name in PORTABLE_TASK_FIELDS
+                    if field_name in raw_task
                 },
                 "state_file": None,
                 "status": "stopped",
@@ -2174,6 +2193,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_subcommand_data_file(create)
     create.add_argument("keyword", help="Xianyu search keyword")
     create.add_argument(
+        "--exclude",
+        dest="exclude_keywords",
+        action="append",
+        default=[],
+        metavar="WORD",
+        help="skip titles containing this word; repeat as needed",
+    )
+    create.add_argument(
         "--max-price",
         type=float,
         help="inclusive finite, non-negative maximum price",
@@ -2235,6 +2262,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_subcommand_data_file(update)
     update.add_argument("task_id", help="task ID returned by create/list")
+    exclude = update.add_mutually_exclusive_group()
+    exclude.add_argument(
+        "--exclude",
+        dest="exclude_keywords",
+        action="append",
+        default=argparse.SUPPRESS,
+        metavar="WORD",
+        help="replace title exclusions; repeat for more words",
+    )
+    exclude.add_argument(
+        "--clear-excludes",
+        dest="exclude_keywords",
+        action="store_const",
+        const=[],
+        default=argparse.SUPPRESS,
+        help="remove title exclusions",
+    )
     update.add_argument("--keyword", default=argparse.SUPPRESS)
     for field_name, option_name in (
         ("min_price", "min-price"),
@@ -2421,6 +2465,7 @@ def main(argv: list[str] | None = None) -> int:
                 min_price=args.min_price,
                 location=args.location,
                 criteria=args.criteria,
+                exclude_keywords=args.exclude_keywords,
                 pages=args.pages,
                 retries=args.retries,
                 state_file=args.state,

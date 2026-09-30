@@ -1,4 +1,4 @@
 interface:
-  display_name: "Xianyu / 闲鱼 Monitor"
-  short_description: "Safely search, monitor, and rank Xianyu listings"
-  default_prompt: "Use $xianyu-monitor to show the offline demo or safely search, monitor, analyze, and explicitly deliver Xianyu/Goofish listing events."
+  display_name: "闲鱼搜索"
+  short_description: "按预算、地区和标题排除词找商品，保存搜索条件并查看上新"
+  default_prompt: "用 $xianyu-monitor 帮我找闲鱼商品，按预算和地区筛选，用简短清单列出价格和链接。"

@@ -18,11 +18,13 @@ EXPECTED_COMMANDS = {
     "state",
     "task",
     "version",
+    "view",
 }
 
 EXPECTED_CONTRACTS = {
-    "task_schema": 3,
-    "task_transfer_schema": 1,
+    "task_schema": 4,
+    "task_transfer_schema": 2,
+    "view_schema": 1,
     "outbox_schema": 1,
     "delivery_schema": 1,
     "ai_run_evidence_schema": 1,
